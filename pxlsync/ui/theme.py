@@ -15,6 +15,7 @@ MUTED = "#8b8b99"
 PASS = "#5ee08a"
 FAIL = "#ff5c5c"
 WARN = "#ffc857"
+LEFT = "#7ab8ff"  # copies going back to the source
 
 MONO = ["JetBrains Mono", "SF Mono", "Menlo", "Cascadia Mono", "Consolas", "DejaVu Sans Mono", "monospace"]
 
@@ -93,6 +94,18 @@ QPushButton#ghost {{ border: 1px solid {LINE}; color: {MUTED}; font-weight: norm
 QPushButton#ghost:hover {{ color: {TEXT}; border-color: {TEXT}; }}
 QPushButton#chip {{ border: 1px solid {LINE}; padding: 2px 6px; font-weight: normal; letter-spacing: 0; }}
 QPushButton#chip:hover {{ border-color: {TEXT}; }}
+
+QPushButton#filter {{ border: 1px solid {LINE}; color: #55555f; padding: 4px 9px; font-weight: bold; letter-spacing: 0; }}
+QPushButton#filter:hover {{ border-color: {MUTED}; }}
+
+QTableView {{
+    background: {PANEL}; alternate-background-color: #101016; border: 1px solid {LINE};
+    selection-background-color: #2a2a36; selection-color: {TEXT};
+}}
+QMenu {{ background: {BOX}; border: 1px solid {TEXT}; padding: 4px; }}
+QMenu::item {{ padding: 6px 18px; }}
+QMenu::item:selected {{ background: {TEXT}; color: {BG}; }}
+QMenu::separator {{ height: 1px; background: {LINE}; margin: 4px 8px; }}
 
 QPushButton#nav {{
     text-align: left; border: none; border-left: 2px solid transparent;

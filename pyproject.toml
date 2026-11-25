@@ -1,7 +1,7 @@
 [project]
 name = "pxlsync"
 version = "0.1.0"
-description = "PXLBOX media sync: codec check, version naming, organizing, FreeFileSync-powered sync"
+description = "PXLBOX media sync: codec check, version naming, organizing, compare + sync"
 requires-python = ">=3.10"
 dependencies = ["PySide6>=6.7"]
 

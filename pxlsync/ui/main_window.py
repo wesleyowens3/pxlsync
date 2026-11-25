@@ -5,15 +5,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from PySide6.QtCore import QProcess, QSettings, QStandardPaths, Qt, QTimer
+from PySide6.QtCore import QSettings, QStandardPaths, Qt, QTimer
 from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import (
-    QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
-    QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
+    QButtonGroup, QCheckBox, QComboBox, QFileDialog, QGridLayout, QHBoxLayout,
+    QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar,
     QStackedWidget, QVBoxLayout, QWidget,
 )
 
-from .. import __version__, ffs, fileops
+from .. import __version__, fileops
 from ..check import CheckResult, CheckRule, check
 from ..codecs import ANY_LABEL, load_presets
 from ..organize import DEFAULT_RULES, OrganizeRule, plan_organize
@@ -23,9 +23,6 @@ from ..tokens import TemplateError
 from . import theme
 from .widgets import button, cell, fill, hrule, label, row, run_task, section, table, vrule
 
-POLICY_BLOCK = "Block the sync"
-POLICY_SKIP = "Skip failing files"
-POLICY_WARN = "Sync everything (warn only)"
 
 RENAME_PRESETS = [
     "{project}_{name}_v{v:3}",
@@ -96,7 +93,7 @@ class MainWindow(QMainWindow):
         self.organize_page = OrganizePage(self)
         self.sync_page = SyncPage(self)
         pages = [("01  CHECK", self.check_page), ("02  RENAME", self.rename_page),
-                 ("03  ORGANIZE", self.organize_page), ("04  SYNC", self.sync_page)]
+                 ("03  ORGANIZE", self.organize_page), ("04  COMPARE+SYNC", self.sync_page)]
         body.addWidget(self._nav([p[0] for p in pages]))
         body.addWidget(vrule())
         for _, page in pages:
@@ -148,6 +145,7 @@ class MainWindow(QMainWindow):
             e.setFixedWidth(170)
             e.textChanged.connect(lambda _=None: self.fields_changed())
         self.source_edit.editingFinished.connect(self._source_changed)
+        self.dest_edit.editingFinished.connect(self._dest_changed)
 
         grid.addWidget(section("Source"), 0, 0)
         grid.addWidget(self.source_edit, 0, 1)
@@ -165,7 +163,7 @@ class MainWindow(QMainWindow):
 
     def _nav(self, names: list[str]) -> QWidget:
         w = QWidget()
-        w.setFixedWidth(190)
+        w.setFixedWidth(220)
         lay = QVBoxLayout(w)
         lay.setContentsMargins(0, 14, 0, 14)
         lay.setSpacing(2)
@@ -191,9 +189,18 @@ class MainWindow(QMainWindow):
             edit.setText(d)
             if edit is self.source_edit:
                 self._source_changed()
+            else:
+                self._dest_changed()
             self.save_settings()
 
+    def _dest_changed(self) -> None:
+        if hasattr(self, "sync_page"):
+            self.sync_page.mark_stale("Destination changed: compare again.")
+        self.save_settings()
+
     def _source_changed(self) -> None:
+        if hasattr(self, "sync_page"):
+            self.sync_page.mark_stale("Source changed: compare again.")
         if self.session.files and Path(self.source_edit.text()) != self.scanned_root:
             self.session = Session()
             self.check_page.render()
@@ -231,12 +238,7 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "pxlsync", text)
 
     def refresh_tool_status(self) -> None:
-        ffs_path = self.sync_page.ffs_path()
-        parts = [
-            f"ffprobe: {'OK' if self.ffprobe else 'NOT FOUND'}",
-            f"FreeFileSync: {'OK' if ffs_path else 'NOT FOUND'}",
-        ]
-        self.tool_status.setText("   ·   ".join(parts))
+        self.tool_status.setText(f"ffprobe: {'OK' if self.ffprobe else 'NOT FOUND (codec check off)'}")
 
     def update_scan_summary(self) -> None:
         s = self.session
@@ -251,6 +253,7 @@ class MainWindow(QMainWindow):
         self.check_page.render()
         self.rename_page.schedule_preview()
         self.organize_page.schedule_preview()
+        self.sync_page.mark_stale("Files in the source changed: compare again.")
 
     def _page_changed(self, index: int) -> None:
         page = self.stack.widget(index)
@@ -371,6 +374,8 @@ class CheckPage(Page):
         rule = self.rule()
         sess.results = {p: check(sess.infos[p], rule) for p in sess.files if p in sess.infos}
         self.render()
+        if hasattr(self.app, "sync_page"):
+            self.app.sync_page.codec_changed()
         self.app.save_settings()
 
     def render(self) -> None:
@@ -656,206 +661,4 @@ class OrganizePage(MovePage):
         s.setValue("org_only_passing", self.only_passing.isChecked())
 
 
-# ============================== 04 SYNC ==============================
-class SyncPage(Page):
-    def __init__(self, app: MainWindow):
-        super().__init__(app, "Sync",
-                         "Copies the source to the destination with FreeFileSync. Failing files can "
-                         "block the sync or be left out of it.")
-        s = app.settings
-        self.mode = QComboBox()
-        self.mode.addItems(list(ffs.MODES))
-        self.mode.setCurrentText(s.value("sync_mode", list(ffs.MODES)[1]))
-        self.policy = QComboBox()
-        self.policy.addItems([POLICY_BLOCK, POLICY_SKIP, POLICY_WARN])
-        self.policy.setCurrentText(s.value("sync_policy", POLICY_BLOCK))
-        for c in (self.mode, self.policy):
-            c.setMinimumWidth(330)
-            c.currentTextChanged.connect(lambda _=None: self.on_show())
-
-        self.ffs_edit = QLineEdit(s.value("ffs_path", ""))
-        self.ffs_edit.setPlaceholderText(ffs.find_freefilesync() or "FreeFileSync not found: click LOCATE")
-        self.ffs_edit.textChanged.connect(lambda _=None: (self.app.refresh_tool_status(), self.on_show()))
-        self.template_edit = QLineEdit(s.value("ffs_template", ""))
-        self.template_edit.setPlaceholderText("Optional: a .ffs_batch saved from FreeFileSync with your preferred settings")
-
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(12)
-        grid.setVerticalSpacing(10)
-        grid.addWidget(section("Mode"), 0, 0)
-        grid.addWidget(self.mode, 0, 1)
-        grid.addWidget(section("If files fail"), 1, 0)
-        grid.addWidget(self.policy, 1, 1)
-        grid.addWidget(section("FreeFileSync"), 2, 0)
-        grid.addWidget(self.ffs_edit, 2, 1, 1, 2)
-        grid.addWidget(button("Locate", "ghost", self.locate_ffs), 2, 3)
-        grid.addWidget(section("Settings template"), 3, 0)
-        grid.addWidget(self.template_edit, 3, 1, 1, 2)
-        grid.addWidget(button("Choose", "ghost", self.choose_template), 3, 3)
-        grid.setColumnStretch(2, 1)
-        self.lay.addLayout(grid)
-
-        self.checklist = QFrame()
-        self.checklist.setObjectName("card")
-        cl = QVBoxLayout(self.checklist)
-        cl.setContentsMargins(16, 12, 16, 12)
-        self.check_label = QLabel()
-        self.check_label.setTextFormat(Qt.TextFormat.RichText)
-        cl.addWidget(self.check_label)
-        self.lay.addWidget(self.checklist)
-
-        self.run_btn = button("Run sync", "primary", self.run_sync)
-        self.verify_btn = button("Verify destination", None, self.verify)
-        self.lay.addLayout(row(button("Save batch file…", "ghost", self.save_batch), None,
-                               self.verify_btn, self.run_btn))
-        self.log = QPlainTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setPlaceholderText("Sync log")
-        self.lay.addWidget(self.log, 1)
-        self.proc: QProcess | None = None
-
-    def ffs_path(self) -> str | None:
-        t = self.ffs_edit.text().strip() if hasattr(self, "ffs_edit") else ""
-        return t if t and Path(t).exists() else ffs.find_freefilesync()
-
-    def locate_ffs(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Locate FreeFileSync")
-        if path:
-            if path.endswith(".app"):
-                path = str(Path(path) / "Contents/MacOS/FreeFileSync")
-            self.ffs_edit.setText(path)
-
-    def choose_template(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "FreeFileSync batch template", "",
-                                              "FreeFileSync (*.ffs_batch *.ffs_gui)")
-        if path:
-            self.template_edit.setText(path)
-
-    def excluded(self) -> list[Path]:
-        return self.app.session.failing() if self.policy.currentText() == POLICY_SKIP else []
-
-    def problems(self) -> list[str]:
-        out = []
-        src, dst = self.app.source(), self.app.dest()
-        if not src or not src.is_dir():
-            out.append("Source folder is missing")
-        if not dst:
-            out.append("Destination folder is not set")
-        elif src and dst.resolve() == src.resolve():
-            out.append("Source and destination are the same folder")
-        if not self.ffs_path():
-            out.append("FreeFileSync is not installed or not located")
-        if not self.app.session.files:
-            out.append("Source not scanned in 01 CHECK")
-        elif self.app.scanned_root != src:
-            out.append("Source changed since the last scan: scan again")
-        bad = self.app.session.failing()
-        if bad and self.policy.currentText() == POLICY_BLOCK:
-            out.append(f"{len(bad)} files failed the codec check")
-        return out
-
-    def on_show(self) -> None:
-        sess = self.app.session
-        bad = sess.failing()
-        lines = []
-        for text, ok in [
-            (f"Source: {self.app.source() or '-'}", bool(self.app.source() and self.app.source().is_dir())),
-            (f"Destination: {self.app.dest() or '-'}", bool(self.app.dest())),
-            (f"FreeFileSync: {self.ffs_path() or 'not found'}", bool(self.ffs_path())),
-            (f"Codec check: {len(sess.files)} files, {len(bad)} failing",
-             bool(sess.files) and (not bad or self.policy.currentText() != POLICY_BLOCK)),
-        ]:
-            color = theme.PASS if ok else theme.FAIL
-            lines.append(f"<span style='color:{color}'>{'■' if ok else '□'}</span>&nbsp;&nbsp;{text}")
-        if bad and self.policy.currentText() == POLICY_SKIP:
-            lines.append(f"<span style='color:{theme.WARN}'>!</span>&nbsp;&nbsp;{len(bad)} failing files will be left out")
-        elif bad and self.policy.currentText() == POLICY_WARN:
-            lines.append(f"<span style='color:{theme.WARN}'>!</span>&nbsp;&nbsp;failing files will be synced anyway")
-        self.check_label.setText("<br>".join(lines))
-        problems = self.problems()
-        self.run_btn.setEnabled(not problems and self.proc is None)
-        self.run_btn.setToolTip("\n".join(problems))
-        self.verify_btn.setEnabled(bool(sess.files) and bool(self.app.dest()))
-
-    def _batch_xml(self) -> str:
-        tpl = self.template_edit.text().strip()
-        return ffs.build_batch(self.app.source(), self.app.dest(), self.mode.currentText(),
-                               self.excluded(), Path(tpl) if tpl else None)
-
-    def save_batch(self) -> None:
-        if not self.app.source() or not self.app.dest():
-            return self.app.error("Set the source and destination first.")
-        path, _ = QFileDialog.getSaveFileName(self, "Save batch file", "pxlsync.ffs_batch", "*.ffs_batch")
-        if path:
-            try:
-                Path(path).write_text(self._batch_xml(), encoding="utf-8")
-            except (OSError, ValueError) as exc:
-                return self.app.error(str(exc))
-            self.log.appendPlainText(f"Saved {path}")
-
-    def run_sync(self) -> None:
-        if problems := self.problems():
-            return self.app.error("\n".join(problems))
-        self.app.save_settings()
-        batch = config_dir() / "last_run.ffs_batch"
-        try:
-            batch.write_text(self._batch_xml(), encoding="utf-8")
-        except (OSError, ValueError) as exc:
-            return self.app.error(f"Could not write the batch file: {exc}")
-        excluded = self.excluded()
-        self.log.appendPlainText(f"▶ {self.mode.currentText().split('(')[0].strip()}  "
-                                 f"{self.app.source()}  →  {self.app.dest()}")
-        if excluded:
-            self.log.appendPlainText(f"  leaving out {len(excluded)} failing files")
-        self.proc = QProcess(self)
-        self.proc.finished.connect(self._sync_finished)
-        self.proc.errorOccurred.connect(lambda e: self.log.appendPlainText(f"Could not start FreeFileSync: {e}"))
-        self.proc.start(self.ffs_path(), [str(batch)])
-        self.on_show()
-
-    def _sync_finished(self, code: int, _status) -> None:
-        self.log.appendPlainText(f"■ {ffs.EXIT_CODES.get(code, f'FreeFileSync exit code {code}')}")
-        self.proc = None
-        self.on_show()
-
-    def verify(self) -> None:
-        """Probe the copies in the destination and compare them with the source."""
-        sess, src, dst = self.app.session, self.app.scanned_root, self.app.dest()
-        skip = set(self.excluded())
-        pairs = [(p, dst / p.relative_to(src)) for p in sess.files if p not in skip]
-        missing = [d for _, d in pairs if not d.exists()]
-        present = [(s, d) for s, d in pairs if d.exists()]
-        self.log.appendPlainText(f"Verifying {len(present)} files in destination…")
-        self.verify_btn.setEnabled(False)
-        ffprobe = self.app.ffprobe
-
-        def work(progress):
-            return probe_many([d for _, d in present], ffprobe, progress)
-
-        def done(infos):
-            bad = 0
-            for (s, d), di in zip(present, infos):
-                si = sess.infos.get(s)
-                keys = ("video_codec", "video_profile", "width", "height", "audio_codec")
-                if di.error or (si and any(getattr(si, k) != getattr(di, k) for k in keys)):
-                    bad += 1
-                    self.log.appendPlainText(f"  ✕ {d}: {di.error or 'codec differs from source'}")
-            for d in missing:
-                self.log.appendPlainText(f"  ✕ missing: {d}")
-            total_bad = bad + len(missing)
-            self.log.appendPlainText(
-                f"■ Verify: {len(present) - bad} OK, {total_bad} problems" if total_bad
-                else f"■ Verify: all {len(present)} files match the source")
-            self.on_show()
-
-        def failed(msg):
-            self.log.appendPlainText(f"Verify failed: {msg}")
-            self.on_show()
-
-        run_task(work, done, failed)
-
-    def save(self, s: QSettings) -> None:
-        s.setValue("sync_mode", self.mode.currentText())
-        s.setValue("sync_policy", self.policy.currentText())
-        s.setValue("ffs_path", self.ffs_edit.text())
-        s.setValue("ffs_template", self.template_edit.text())
+from .sync_page import SyncPage  # noqa: E402  (imports Page from this module)
