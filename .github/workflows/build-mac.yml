@@ -18,7 +18,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - runner: macos-14   # Apple Silicon (M1 and newer)
+          - runner: macos-latest   # Apple Silicon (M1 and newer); always the current image
             arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
