@@ -7,3 +7,4 @@ dist/
 vendor/ffprobe
 vendor/ffprobe.exe
 *.bundle
+.venv-build/

@@ -1,0 +1,41 @@
+# Builds the macOS installer on GitHub's Macs.
+# Runs on every push to main and on version tags (v0.1.0, ...); can also be started by hand
+# from the Actions tab. Download the .dmg from the run's "Artifacts" section, or from the
+# Release page for tagged versions.
+name: macOS installer
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write  # to attach the .dmg to a GitHub Release on tags
+
+jobs:
+  dmg:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-14   # Apple Silicon (M1 and newer)
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ffmpeg (for the tests)
+        run: brew install ffmpeg
+      - name: Build installer
+        run: scripts/make_dmg.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pxlsync-macos-${{ matrix.arch }}
+          path: dist/*.dmg
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.dmg

@@ -31,13 +31,39 @@ python run_pxlsync.py
 python -m pytest            # 13 tests, uses real ffmpeg-encoded clips
 ```
 
-## Build the app
+## macOS installer (.dmg)
 
-- macOS: `scripts/build_mac.sh` → `dist/pxlsync.app`
-- Windows: `scripts\build_windows.ps1` → `dist\pxlsync\pxlsync.exe`
+**On any Mac** (macOS 12+, Python 3.10+), from the repo folder:
 
-Build each on its own OS (PyInstaller can't cross-compile). Unsigned Mac builds need
-right-click → Open the first time; sign and notarize for wider rollout.
+```bash
+scripts/make_dmg.sh
+```
+
+This runs the tests, builds `pxlsync.app` and packs it into `dist/pxlsync-<version>.dmg`, with
+the usual "drag to Applications" window. The app runs on Macs with the same chip as the one
+that built it (Apple Silicon → Apple Silicon).
+
+**On GitHub**: `.github/workflows/build-mac.yml` builds the same DMG on GitHub's Macs for every
+push to `main` (download it under the run's *Artifacts*) and attaches it to a Release when you push a
+tag like `v0.1.0`.
+
+**Gatekeeper**: builds are unsigned unless you have an Apple Developer ID. On another Mac the
+first launch is blocked; open **System Settings → Privacy & Security → Open Anyway** once.
+To remove that step, sign and notarize ($99/yr Apple Developer account):
+
+```bash
+PXLSYNC_SIGN_ID="Developer ID Application: PXLBOX (TEAMID)" PXLSYNC_NOTARY_PROFILE=pxlbox scripts/make_dmg.sh
+```
+
+(create the profile once with `xcrun notarytool store-credentials pxlbox`).
+
+**ffprobe**: each Mac needs `brew install ffmpeg` for the codec check, or put a standalone
+`ffprobe` build in `vendor/` before building to ship it inside the app.
+
+## Windows build
+
+`scripts\build_windows.ps1` → `dist\pxlsync\pxlsync.exe` (run on Windows; PyInstaller can't
+cross-compile).
 
 ## Customizing
 
