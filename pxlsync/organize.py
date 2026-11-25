@@ -26,9 +26,11 @@ class OrganizeRule:
         return asdict(self)
 
 
+# {mdate} (the file's own date) keeps folders stable; {date} (today) would move
+# already-organized files into a new folder every day.
 DEFAULT_RULES = [
-    OrganizeRule("*.mov;*.mp4;*.mxf", "{date:%Y-%m-%d}/VIDEO/{codec:upper}"),
-    OrganizeRule("*.wav;*.aif;*.aiff", "{date:%Y-%m-%d}/AUDIO"),
+    OrganizeRule("*.mov;*.mp4;*.mxf", "{mdate:%Y-%m-%d}/VIDEO/{codec:upper}"),
+    OrganizeRule("*.wav;*.aif;*.aiff", "{mdate:%Y-%m-%d}/AUDIO"),
 ]
 
 
@@ -62,8 +64,11 @@ def plan_organize(
     fields: dict[str, str],
     infos: dict[Path, MediaInfo] | None = None,
     presets: list[CodecPreset] | None = None,
+    real_paths: dict[Path, Path] | None = None,
 ) -> list[Move]:
+    """``real_paths`` maps planned (renamed) paths to where the files are now."""
     infos = infos or {}
+    real_paths = real_paths or {}
     presets = presets or []
     moves = []
     for seq, path in enumerate(files, start=1):
@@ -72,7 +77,7 @@ def plan_organize(
         if rule is None:
             moves.append(Move(path, path))
             continue
-        ctx = build_context(path, info, fields)
+        ctx = build_context(path, info, fields, real_paths.get(path))
         ctx["seq"] = seq
         rendered = render(rule.folder, ctx)
         parts = [safe_component(p) for p in rendered.replace("\\", "/").split("/") if p.strip()]

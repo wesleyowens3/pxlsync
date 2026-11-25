@@ -1,29 +1,44 @@
-"""pxlsync main window: 01 CHECK, 02 RENAME, 03 ORGANIZE, 04 SYNC."""
+"""pxlsync main window: one screen, FreeFileSync-style.
+
+Folder pairs on top, one toolbar (codec check, rename, organize, sync mode), and a
+single compare grid. COMPARE scans codecs, plans the new names/folders and compares
+against the destinations; SYNCHRONIZE applies the renames in the source and copies.
+"""
 
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, QStandardPaths, Qt, QTimer
-from PySide6.QtGui import QIcon, QPixmap
+from PySide6.QtCore import QFile, QSettings, QStandardPaths, Qt
+from PySide6.QtGui import QAction, QIcon, QPixmap
 from PySide6.QtWidgets import (
-    QButtonGroup, QCheckBox, QComboBox, QHBoxLayout,
-    QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar,
-    QStackedWidget, QVBoxLayout, QWidget,
+    QAbstractItemView, QCheckBox, QComboBox, QGridLayout, QHBoxLayout, QHeaderView, QLabel,
+    QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
+    QTableView, QVBoxLayout, QWidget,
 )
 
-from .. import __version__, fileops
-from ..check import CheckResult, CheckRule, check
+from .. import __version__, fileops, syncer
+from ..check import CheckRule, check
 from ..codecs import ANY_LABEL, load_presets
-from ..organize import DEFAULT_RULES, OrganizeRule, plan_organize
+from ..compare import (
+    MODE_HELP, Action, Category, Comparison, Method, Mode, Row, compare, hold, parse_excludes, plan,
+    possible_actions,
+)
+from ..organize import DEFAULT_RULES, OrganizeRule
+from ..pipeline import names_for_root, plan_source_moves
 from ..probe import MediaInfo, find_ffprobe, probe_many, scan_media
-from ..rename import existing_names, plan_renames
-from ..tokens import TemplateError
+from ..rename import existing_names
 from . import theme
+from .dialogs import DEL_FOLDER, DEL_PERMANENT, DEL_SYSTEM, OptionsDialog, OrganizeDialog
+from .grid import B_SAME, BUCKETS, C_CODEC, C_DST, C_FORMAT, C_NEW, C_SRC, CompareModel, human
 from .pairs import FolderPairs
-from .widgets import button, cell, fill, hrule, label, row, run_task, section, table, vrule
+from .widgets import button, hrule, label, row, run_task, section, vrule
 
+POLICY_BLOCK = "Block sync if any fail"
+POLICY_SKIP = "Hold back failing"
+POLICY_WARN = "Sync failing anyway"
 
 RENAME_PRESETS = [
     "{project}_{name}_v{v:3}",
@@ -31,8 +46,13 @@ RENAME_PRESETS = [
     "{project}_{name}_{codec:upper}_{res}_v{v:3}",
     "{project}_{seq:4}_v{v:2}",
 ]
-TOKENS = ["{project}", "{client}", "{name}", "{v:3}", "{seq:3}", "{date}", "{mdate}",
-          "{codec}", "{profile}", "{res}", "{fps}", "{kind}", "{folder}"]
+TOKENS = [
+    ("{project}", "Project field"), ("{client}", "Client field"), ("{name}", "Original name"),
+    ("{v:3}", "Version, 3 digits (continues from existing files)"), ("{seq:3}", "Counter"),
+    ("{date}", "Today, YYYYMMDD"), ("{date:%Y-%m-%d}", "Today, YYYY-MM-DD"), ("{mdate}", "File's modified date"),
+    ("{codec}", "Codec"), ("{profile}", "Codec profile"), ("{res}", "Resolution"), ("{fps}", "Frame rate"),
+    ("{kind}", "video / audio / other"), ("{folder}", "Parent folder name"),
+]
 
 
 def config_dir() -> Path:
@@ -41,42 +61,26 @@ def config_dir() -> Path:
     return d
 
 
-class Session:
-    """What has been scanned: shared by every page."""
-
-    def __init__(self) -> None:
-        self.files: list[Path] = []
-        self.roots: list[Path] = []  # source folders the scan covered
-        self.infos: dict[Path, MediaInfo] = {}
-        self.results: dict[Path, CheckResult] = {}
-
-    def failing(self) -> list[Path]:
-        return [p for p, r in self.results.items() if not r.ok]
-
-    def apply_moves(self, moves: list[fileops.Move]) -> None:
-        """Keep scan results valid after files were renamed or moved."""
-        mapping = {m.src: m.dst for m in moves if m.changes and not m.problem}
-        self.files = [mapping.get(p, p) for p in self.files]
-        for store in (self.infos, self.results):
-            for old, new in mapping.items():
-                if old in store:
-                    store[new] = store.pop(old)
-        for path, info in self.infos.items():
-            info.path = path
-
-
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.settings = QSettings("PXLBOX", "pxlsync")
-        self.session = Session()
         self.video_presets, self.audio_presets = load_presets(config_dir() / "codec_presets.json")
         self.ffprobe = find_ffprobe()
+        self.probe_cache: dict[Path, tuple[int, float, MediaInfo]] = {}
+        self.infos: dict[Path, MediaInfo] = {}
+        self.results: dict = {}
+        self.source_moves: list[fileops.Move] = []
+        self.comparisons: list[Comparison] = []
+        self.cancel_flag = threading.Event()
+        self.busy = False
+        self._last = ""
+        self._load_options()
 
         self.setWindowTitle("pxlsync")
         self.setWindowIcon(QIcon(str(theme.ASSETS / "icon.png")))
-        self.resize(1240, 800)
-        self.setMinimumSize(980, 640)
+        self.resize(1440, 900)
+        self.setMinimumSize(1100, 680)
 
         central = QWidget()
         outer = QVBoxLayout(central)
@@ -84,40 +88,40 @@ class MainWindow(QMainWindow):
         outer.setSpacing(0)
         outer.addWidget(self._header())
         outer.addWidget(hrule())
-        outer.addWidget(self._folder_bar())
+        outer.addWidget(self._pairs())
         outer.addWidget(hrule())
-
-        body = QHBoxLayout()
-        body.setSpacing(0)
-        self.stack = QStackedWidget()
-        self.check_page = CheckPage(self)
-        self.rename_page = RenamePage(self)
-        self.organize_page = OrganizePage(self)
-        self.sync_page = SyncPage(self)
-        pages = [("01  CHECK", self.check_page), ("02  RENAME", self.rename_page),
-                 ("03  ORGANIZE", self.organize_page), ("04  COMPARE+SYNC", self.sync_page)]
-        body.addWidget(self._nav([p[0] for p in pages]))
-        body.addWidget(vrule())
-        for _, page in pages:
-            self.stack.addWidget(page)
-        body.addWidget(self.stack, 1)
+        body = QVBoxLayout()
+        body.setContentsMargins(22, 14, 22, 12)
+        body.setSpacing(10)
+        body.addLayout(self._toolbar())
+        body.addWidget(hrule())
+        body.addLayout(self._chips())
+        body.addWidget(self._grid(), 1)
+        body.addLayout(self._status_row())
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setPlaceholderText("Log")
+        self.log.setMaximumHeight(56)
+        body.addWidget(self.log)
         outer.addLayout(body, 1)
         self.setCentralWidget(central)
 
-        self.tool_status = QLabel()
+        self.tool_status = QLabel(
+            f"ffprobe: {'OK' if self.ffprobe else 'NOT FOUND, codec check off (brew install ffmpeg)'}")
         self.statusBar().addPermanentWidget(self.tool_status)
         self.statusBar().setSizeGripEnabled(False)
-        self.refresh_tool_status()
-        self.stack.currentChanged.connect(self._page_changed)
+        self._update_columns()
+        self._set_busy(False)
+        self.mark_stale("Press COMPARE to see what will happen.")
 
-    # ---------- layout pieces ----------
+    # ================= layout =================
     def _header(self) -> QWidget:
         w = QWidget()
         lay = QHBoxLayout(w)
         lay.setContentsMargins(22, 14, 22, 14)
         logo = QLabel()
-        pix = QPixmap(str(theme.ASSETS / "logo.png"))
-        logo.setPixmap(pix.scaledToHeight(34, Qt.TransformationMode.SmoothTransformation))
+        logo.setPixmap(QPixmap(str(theme.ASSETS / "logo.png")).scaledToHeight(
+            34, Qt.TransformationMode.SmoothTransformation))
         lay.addWidget(logo)
         lay.addSpacing(16)
         lay.addWidget(vrule())
@@ -132,13 +136,13 @@ class MainWindow(QMainWindow):
         self.client_edit.setPlaceholderText("e.g. ACME")
         for title, e in (("Project", self.project_edit), ("Client", self.client_edit)):
             e.setFixedWidth(160)
-            e.textChanged.connect(lambda _=None: self.fields_changed())
+            e.editingFinished.connect(lambda e=e: self._edited(e, "Project / client changed"))
             lay.addWidget(section(title))
             lay.addWidget(e)
             lay.addSpacing(12)
         return w
 
-    def _folder_bar(self) -> QWidget:
+    def _pairs(self) -> QWidget:
         saved = self.settings.value("pairs", "")
         try:
             pairs = [tuple(p) for p in json.loads(saved)] if saved else []
@@ -147,530 +151,695 @@ class MainWindow(QMainWindow):
         if not pairs:  # settings from before folder pairs existed
             pairs = [(self.settings.value("source", ""), self.settings.value("dest", ""))]
         self.pairs_panel = FolderPairs(pairs)
-        self.pairs_panel.changed.connect(self._pairs_changed)
+        self.pairs_panel.changed.connect(lambda: self.settings_changed("Folders changed"))
         return self.pairs_panel
 
-    def _nav(self, names: list[str]) -> QWidget:
-        w = QWidget()
-        w.setFixedWidth(220)
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, 14, 0, 14)
-        lay.setSpacing(2)
-        self.nav_group = QButtonGroup(self)
-        for i, name in enumerate(names):
-            b = button(name, "nav")
-            b.setCheckable(True)
-            self.nav_group.addButton(b, i)
-            lay.addWidget(b)
-        self.nav_group.button(0).setChecked(True)
-        self.nav_group.idClicked.connect(self.stack.setCurrentIndex)
-        lay.addStretch(1)
-        self.scan_summary = label("Nothing scanned yet", "hint")
-        self.scan_summary.setWordWrap(True)
-        self.scan_summary.setContentsMargins(18, 0, 12, 0)
-        lay.addWidget(self.scan_summary)
-        return w
+    def _toolbar(self) -> QGridLayout:
+        s = self.settings
+        g = QGridLayout()
+        g.setHorizontalSpacing(10)
+        g.setVerticalSpacing(8)
 
-    # ---------- folder pairs ----------
-    def _pairs_changed(self) -> None:
-        if hasattr(self, "sync_page"):
-            self.sync_page.mark_stale("Folders changed: compare again.")
-        if self.session.files and not self.scan_current():
-            self.session = Session()
-            self.check_page.render()
-            self.update_scan_summary()
-        self.rename_page.schedule_preview() if hasattr(self, "rename_page") else None
-        self.save_settings()
+        self.compare_btn = button("Compare", "primary", self.run_compare)
+        self.compare_btn.setToolTip("Check codecs, plan new names and folders, and compare every folder pair.\n"
+                                    "Nothing changes until you press SYNCHRONIZE.")
+        self.sync_btn = button("Synchronize", "primary", self.run_sync)
+        for b in (self.compare_btn, self.sync_btn):
+            b.setMinimumWidth(160)
+            b.setSizePolicy(b.sizePolicy().horizontalPolicy(), b.sizePolicy().Policy.Expanding)
 
-    def pairs(self) -> list[tuple[Path | None, Path | None]]:
-        """Folder pairs that aren't completely empty."""
-        out = []
-        for left, right in self.pairs_panel.pairs():
-            if left or right:
-                out.append((Path(left) if left else None, Path(right) if right else None))
-        return out
+        # codec check
+        self.video_combo = QComboBox()
+        self.video_combo.addItems([p.label for p in self.video_presets])
+        self.video_combo.setCurrentText(s.value("video_preset", ANY_LABEL))
+        self.video_combo.setToolTip("Video codec every file must use")
+        self.audio_combo = QComboBox()
+        self.audio_combo.addItems([p.label for p in self.audio_presets])
+        self.audio_combo.setCurrentText(s.value("audio_preset", ANY_LABEL))
+        self.audio_combo.setToolTip("Audio codec every file must use")
+        # sync mode
+        self.mode = QComboBox()
+        self.mode.addItems([m.value for m in Mode])
+        for i, m in enumerate(Mode):
+            self.mode.setItemData(i, MODE_HELP[m], Qt.ItemDataRole.ToolTipRole)
+        self.mode.setCurrentText(s.value("sync_mode", Mode.MIRROR.value))
+        if self.mode.currentIndex() < 0:
+            self.mode.setCurrentIndex(0)
+        self.policy = QComboBox()
+        self.policy.addItems([POLICY_BLOCK, POLICY_SKIP, POLICY_WARN])
+        self.policy.setCurrentText(s.value("sync_policy", POLICY_BLOCK))
+        self.policy.setToolTip("What happens to files that fail the codec check")
+        for c in (self.video_combo, self.audio_combo, self.mode, self.policy):
+            c.setMinimumWidth(190)
 
-    def sources(self) -> list[Path]:
-        seen: list[Path] = []
-        for left, _ in self.pairs():
-            if left and left not in seen:
-                seen.append(left)
-        return seen
+        # rename
+        self.rename_chk = QCheckBox("RENAME")
+        self.rename_chk.setChecked(s.value("rename_on", False, type=bool))
+        self.rename_chk.setToolTip("Rename files to the template in the source when you synchronize")
+        self.template = QComboBox()
+        self.template.setEditable(True)
+        self.template.setMinimumWidth(220)
+        self.template.addItems(RENAME_PRESETS)
+        self.template.setCurrentText(s.value("rename_template", RENAME_PRESETS[0]))
+        self.template.lineEdit().editingFinished.connect(
+            lambda: self._edited(self.template.lineEdit(), "Rename template changed"))
+        self.template.activated.connect(lambda _=None: self.settings_changed("Rename template changed"))
+        tokens = QPushButton("+ TOKEN")
+        tokens.setObjectName("ghost")
+        menu = QMenu(tokens)
+        for tok, desc in TOKENS:
+            act = QAction(f"{tok:<18} {desc}", menu)
+            act.triggered.connect(lambda _=False, t=tok: self._insert_token(t))
+            menu.addAction(act)
+        tokens.setMenu(menu)
+        self.rename_chk.toggled.connect(lambda _=None: self.settings_changed("Rename turned on/off"))
+        # organize
+        self.organize_chk = QCheckBox("ORGANIZE")
+        self.organize_chk.setChecked(s.value("organize_on", False, type=bool))
+        self.organize_chk.setToolTip("Sort files into folders in the source when you synchronize")
+        self.organize_chk.toggled.connect(lambda _=None: self.settings_changed("Organize turned on/off"))
+        saved = s.value("org_rules", "")
+        try:
+            self.rules = [OrganizeRule(**r) for r in json.loads(saved)] if saved else list(DEFAULT_RULES)
+        except (ValueError, TypeError):
+            self.rules = list(DEFAULT_RULES)
+        # Earlier versions saved default rules that used {date} (today): switch those to {mdate}.
+        if [(r.pattern, r.folder, r.codec) for r in self.rules] == [
+                (r.pattern, r.folder.replace("{mdate", "{date"), r.codec) for r in DEFAULT_RULES]:
+            self.rules = list(DEFAULT_RULES)
+        self.rules_label = label("", "hint")
+        rules_btn = button("Edit rules", "ghost", self.edit_rules)
+        options_btn = button("⚙ Options", "ghost", self.edit_options)
 
-    def dests(self) -> list[Path]:
-        return [r for _, r in self.pairs() if r]
+        g.addWidget(self.compare_btn, 0, 0, 2, 1)
+        g.addWidget(section("Codec"), 0, 1)
+        g.addWidget(self.video_combo, 0, 2)
+        g.addWidget(self.audio_combo, 0, 3)
+        g.addWidget(section("Sync"), 1, 1)
+        g.addWidget(self.mode, 1, 2)
+        g.addWidget(self.policy, 1, 3)
+        g.addWidget(vrule(), 0, 4, 2, 1)
+        g.addWidget(self.rename_chk, 0, 5)
+        g.addWidget(self.template, 0, 6)
+        g.addWidget(tokens, 0, 7)
+        g.addWidget(self.organize_chk, 1, 5)
+        g.addWidget(self.rules_label, 1, 6)
+        g.addWidget(rules_btn, 1, 7)
+        g.addWidget(options_btn, 0, 8, 2, 1)
+        g.addWidget(self.sync_btn, 0, 9, 2, 1)
+        g.setColumnStretch(6, 1)
 
-    def scan_current(self) -> bool:
-        """True when the last codec scan covered exactly today's source folders."""
-        return bool(self.session.roots) and self.session.roots == self.sources()
+        self.video_combo.currentTextChanged.connect(lambda _=None: self.codec_changed())
+        self.audio_combo.currentTextChanged.connect(lambda _=None: self.codec_changed())
+        self.policy.currentTextChanged.connect(lambda _=None: self.codec_changed())
+        self.mode.currentTextChanged.connect(lambda _=None: (self.save_settings(), self.replan(reset_overrides=True)))
+        self._update_rules_label()
+        self.toolbar_widgets = [self.video_combo, self.audio_combo, self.mode, self.policy, self.rename_chk,
+                                self.template, tokens, self.organize_chk, rules_btn, options_btn]
+        return g
 
-    def root_of(self, path: Path) -> Path | None:
-        best = None
-        for root in self.session.roots:
-            if path.is_relative_to(root) and (best is None or len(root.parts) > len(best.parts)):
-                best = root
-        return best
+    def _chips(self) -> QHBoxLayout:
+        self.chips: dict[str, QPushButton] = {}
+        items: list = [section("Show")]
+        for key, text, color in BUCKETS:
+            c = button(text, "filter")
+            c.setCheckable(True)
+            c.setChecked(key != B_SAME)
+            c.setStyleSheet(f"QPushButton:checked {{ color: {color}; border-color: {color}; }}")
+            c.toggled.connect(lambda on, k=key: self._toggle_bucket(k, on))
+            self.chips[key] = c
+            items.append(c)
+        items.append(None)
+        self.mode.currentTextChanged.connect(self._update_mode_hint)
+        self._update_mode_hint()
+        return row(*items, spacing=6)
 
-    def display_path(self, path: Path) -> str:
-        root = self.root_of(path)
-        if not root:
-            return str(path)
-        rel = path.relative_to(root).as_posix()
-        return f"{root.name}/{rel}" if len(self.session.roots) > 1 else rel
+    def _grid(self) -> QTableView:
+        self.model = CompareModel()
+        v = self.view = QTableView()
+        v.setModel(self.model)
+        self.model.modelReset.connect(self._apply_spans)
+        v.verticalHeader().setVisible(False)
+        v.verticalHeader().setDefaultSectionSize(26)
+        v.setShowGrid(False)
+        v.setAlternatingRowColors(True)
+        v.setWordWrap(False)
+        v.setTextElideMode(Qt.TextElideMode.ElideLeft)  # long paths keep their file name visible
+        v.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        v.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        v.customContextMenuRequested.connect(self._menu)
+        hdr = v.horizontalHeader()
+        hdr.setHighlightSections(False)
+        hdr.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        for col in range(self.model.columnCount()):
+            hdr.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        for col in (C_SRC, C_NEW, C_DST):
+            hdr.setSectionResizeMode(col, QHeaderView.ResizeMode.Stretch)
+        return v
 
-    def fields(self) -> dict[str, str]:
-        return {"project": self.project_edit.text().strip(), "client": self.client_edit.text().strip()}
+    def _status_row(self) -> QHBoxLayout:
+        self.summary = label("", "summary")
+        self.progress_text = label("", "hint")
+        self.progress = QProgressBar()
+        self.progress.setFixedWidth(240)
+        self.cancel_btn = button("Cancel", "ghost", self.cancel_flag.set)
+        self.undo_btn = button("Undo renames", "ghost", self.undo_renames)
+        self.undo_btn.setToolTip("Put the files renamed/moved by the last sync back where they were")
+        self.verify_btn = button("Verify destination", "ghost", self.verify)
+        self.verify_btn.setToolTip("Re-read the copies in the destination and check their codecs match the source")
+        return row(self.summary, self.progress_text, None, self.progress, self.cancel_btn,
+                   self.undo_btn, self.verify_btn)
 
-    def fields_changed(self) -> None:
-        self.rename_page.schedule_preview()
-        self.organize_page.schedule_preview()
+    # ================= small helpers =================
+    def _load_options(self) -> None:
+        s = self.settings
+        self.options = {
+            "method": s.value("cmp_method", Method.TIME_SIZE.value),
+            "deletion": s.value("sync_deletion", DEL_FOLDER),
+            "excludes": s.value("sync_excludes", ""),
+            "require_audio": s.value("require_audio", False, type=bool),
+            "strip_version": s.value("rename_strip", True, type=bool),
+            "lowercase_ext": s.value("rename_lower_ext", False, type=bool),
+        }
 
-    def journal_dir(self) -> Path:
-        return config_dir() / "journals"
+    def _insert_token(self, token: str) -> None:
+        self.template.lineEdit().insert(token)
+        self.template.setFocus()
+        self.settings_changed("Rename template changed")
 
-    def need_scan(self) -> bool:
-        if self.session.files:
-            return False
-        QMessageBox.information(self, "pxlsync", "Scan the source folders first (01 CHECK).")
-        self.nav_group.button(0).click()
-        return True
+    def _edited(self, edit: QLineEdit, why: str) -> None:
+        if edit.isModified():
+            edit.setModified(False)
+            self.settings_changed(why)
+
+    def _update_mode_hint(self, *_):
+        self.mode.setToolTip(MODE_HELP[Mode(self.mode.currentText())])
+
+    def _update_rules_label(self) -> None:
+        n = len(self.rules)
+        first = self.rules[0].folder if self.rules else ""
+        self.rules_label.setText(f"{n} rule{'s' if n != 1 else ''}" + (f"  ·  {first} …" if first else ""))
+
+    def _update_columns(self) -> None:
+        self.view.setColumnHidden(C_NEW, not (self.rename_chk.isChecked() or self.organize_chk.isChecked()))
+        self.view.setColumnHidden(C_CODEC, not self.ffprobe)
+        self.view.setColumnHidden(C_FORMAT, not self.ffprobe)
+
+    def _toggle_bucket(self, key: str, on: bool) -> None:
+        (self.model.shown.add if on else self.model.shown.discard)(key)
+        self.model.refilter()
+
+    def _apply_spans(self) -> None:
+        self.view.clearSpans()
+        for n in self.model.header_rows():
+            self.view.setSpan(n, 0, 1, self.model.columnCount())
 
     def error(self, text: str) -> None:
         QMessageBox.warning(self, "pxlsync", text)
 
-    def refresh_tool_status(self) -> None:
-        self.tool_status.setText(f"ffprobe: {'OK' if self.ffprobe else 'NOT FOUND (codec check off)'}")
+    def journal_dir(self) -> Path:
+        return config_dir() / "journals"
 
-    def update_scan_summary(self) -> None:
-        s = self.session
-        if not s.files:
-            self.scan_summary.setText("Nothing scanned yet")
+    def fields(self) -> dict[str, str]:
+        return {"project": self.project_edit.text().strip(), "client": self.client_edit.text().strip()}
+
+    def pairs(self) -> list[tuple[Path | None, Path | None]]:
+        return [(Path(left) if left else None, Path(right) if right else None)
+                for left, right in self.pairs_panel.pairs() if left or right]
+
+    def all_rows(self) -> list[Row]:
+        return [r for c in self.comparisons for r in c.rows]
+
+    def check_rule(self) -> CheckRule:
+        v = next(p for p in self.video_presets if p.label == self.video_combo.currentText())
+        a = next(p for p in self.audio_presets if p.label == self.audio_combo.currentText())
+        return CheckRule(video=v, audio=a, require_audio=self.options["require_audio"])
+
+    # ================= state changes =================
+    def settings_changed(self, why: str) -> None:
+        self._update_columns()
+        self.save_settings()
+        if self.comparisons:
+            self.mark_stale(f"{why}: press COMPARE again.")
+
+    def codec_changed(self) -> None:
+        self.save_settings()
+        if self.comparisons and not self.busy:
+            self.run_compare()  # codec scans are cached, so this is quick
+
+    def mark_stale(self, message: str) -> None:
+        self.comparisons = []
+        self.source_moves = []
+        self.model.set_comparisons([])
+        self.summary.setText(message.upper())
+        self.summary.setStyleSheet(f"color: {theme.MUTED};")
+        self.progress_text.setText("")
+        self._update_chips()
+        self._update_sync_button()
+
+    def _set_busy(self, busy: bool, text: str = "") -> None:
+        self.busy = busy
+        self.progress.setVisible(busy)
+        self.cancel_btn.setVisible(busy)
+        self.progress_text.setText(text)
+        self.compare_btn.setEnabled(not busy)
+        self.pairs_panel.setEnabled(not busy)
+        for w in self.toolbar_widgets + [self.project_edit, self.client_edit, self.undo_btn, self.verify_btn]:
+            w.setEnabled(not busy)
+        self._update_sync_button()
+
+    def _update_chips(self) -> None:
+        counts = self.model.counts()
+        for key, text, _ in BUCKETS:
+            self.chips[key].setText(f"{text}  {counts[key]}")
+
+    def _update_sync_button(self) -> None:
+        rows = self.all_rows()
+        renames = [m for m in self.source_moves if m.changes and not m.problem]
+        ok = not self.busy and (any(r.action != Action.NONE for r in rows) or bool(renames))
+        tip = "" if ok else "Compare first"
+        if rows and self.policy.currentText() == POLICY_BLOCK:
+            blocked = sum(r.held for r in rows)
+            if blocked:
+                ok = False
+                tip = f"{blocked} files failed the codec check. Fix them or change what happens to failing files."
+                self.summary.setText(f"BLOCKED  ·  {blocked} FILES FAILED THE CODEC CHECK")
+                self.summary.setStyleSheet(f"color: {theme.FAIL};")
+        self.sync_btn.setEnabled(ok)
+        self.sync_btn.setToolTip(tip)
+
+    # ================= dialogs =================
+    def edit_rules(self) -> None:
+        labels = [p.label for p in self.video_presets + self.audio_presets if not p.is_any]
+        dlg = OrganizeDialog(self, self.rules, labels)
+        if dlg.exec():
+            self.rules = dlg.rules()
+            self._update_rules_label()
+            if self.rules and not self.organize_chk.isChecked():
+                self.organize_chk.setChecked(True)  # editing rules means you want them
+            self.settings_changed("Organize rules changed")
+
+    def edit_options(self) -> None:
+        dlg = OptionsDialog(self, self.options)
+        if dlg.exec():
+            self.options = dlg.values()
+            self.settings_changed("Options changed")
+
+    # ================= compare =================
+    def problems(self) -> list[str]:
+        pairs = self.pairs()
+        if not pairs:
+            return ["Add a folder pair at the top: a source on the left, a destination on the right."]
+        out = []
+        for n, (src, dst) in enumerate(pairs, start=1):
+            if not src:
+                out.append(f"Pair {n}: choose a source folder.")
+            elif not src.is_dir():
+                out.append(f"Pair {n}: source folder doesn't exist ({src}).")
+            if not dst:
+                out.append(f"Pair {n}: choose a destination folder.")
+            elif src:
+                s_, d_ = src.resolve(), dst.resolve()
+                if s_ == d_:
+                    out.append(f"Pair {n}: source and destination are the same folder.")
+                elif d_.is_relative_to(s_) or s_.is_relative_to(d_):
+                    out.append(f"Pair {n}: one folder is inside the other.")
+        dests = [(n, d.resolve()) for n, (_, d) in enumerate(pairs, start=1) if d]
+        for i, (n1, d1) in enumerate(dests):
+            for n2, d2 in dests[i + 1:]:
+                if d1 == d2 or d1.is_relative_to(d2) or d2.is_relative_to(d1):
+                    out.append(f"Pairs {n1} and {n2} write to the same destination.")
+            for n2, (s2, _) in enumerate(pairs, start=1):
+                if s2 and n2 != n1 and (d1 == s2.resolve() or d1.is_relative_to(s2.resolve())):
+                    out.append(f"Pair {n1}'s destination is inside pair {n2}'s source.")
+        return out
+
+    def run_compare(self) -> None:
+        if problems := self.problems():
+            return self.error("\n".join(problems))
+        self.save_settings()
+        pairs = self.pairs()
+        sources = list(dict.fromkeys(src for src, _ in pairs))
+        dests = [d for _, d in pairs]
+        ffprobe = self.ffprobe
+        rule = self.check_rule()
+        hold_failing = self.policy.currentText() != POLICY_WARN
+        template = self.template.currentText().strip() if self.rename_chk.isChecked() else None
+        rules = list(self.rules) if self.organize_chk.isChecked() else None
+        fields = self.fields()
+        presets = self.video_presets + self.audio_presets
+        method = Method(self.options["method"])
+        excludes = parse_excludes(self.options["excludes"])
+        strip, lower = self.options["strip_version"], self.options["lowercase_ext"]
+        cache = dict(self.probe_cache)
+        cancelled = self.cancel_flag.is_set
+        self.cancel_flag.clear()
+        self.progress.setRange(0, 0)
+        self._set_busy(True, "Scanning…")
+
+        def root_of(p: Path) -> Path | None:
+            best = None
+            for r in sources:
+                if p.is_relative_to(r) and (best is None or len(r.parts) > len(best.parts)):
+                    best = r
+            return best
+
+        def work(progress):
+            self._last = "Finding media files…"
+            progress(0, 0)
+            files: list[Path] = []
+            seen: set[Path] = set()
+            for root in sources:
+                for f in scan_media(root):
+                    if f not in seen:
+                        seen.add(f)
+                        files.append(f)
+            infos: dict[Path, MediaInfo] = {}
+            todo = []
+            for f in files:
+                try:
+                    st = f.stat()
+                except OSError:
+                    continue
+                hit = cache.get(f)
+                if hit and hit[0] == st.st_size and hit[1] == st.st_mtime:
+                    infos[f] = hit[2]
+                else:
+                    todo.append((f, st))
+            if ffprobe and todo:
+                def p(d, t):
+                    self._last = f"Checking codecs… {d}/{t}"
+                    progress(d, t)
+                for (f, st), info in zip(todo, probe_many([f for f, _ in todo], ffprobe, p)):
+                    infos[f] = info
+                    cache[f] = (st.st_size, st.st_mtime, info)
+            results = {f: check(i, rule) for f, i in infos.items()} if ffprobe else {}
+            failing = {f for f, r in results.items() if not r.ok}
+
+            moves: list[fileops.Move] = []
+            if template or rules:
+                self._last = "Planning names and folders…"
+                progress(0, 0)
+                planned = [f for f in files if not (hold_failing and f in failing)]  # failing files keep their names
+                known = existing_names(*sources, *dests) if template else None
+                moves = plan_source_moves(planned, root_of, infos, fields, template=template, strip_version=strip,
+                                          lowercase_ext=lower, known_names=known, rules=rules, presets=presets)
+            comparisons = []
+            for i, (src, dst) in enumerate(pairs):
+                self._last = f"Comparing pair {i + 1}…" if len(pairs) > 1 else "Comparing…"
+                progress(0, 0)
+                comparisons.append(compare(src, dst, method, excludes, None, cancelled, pair=i,
+                                           left_names=names_for_root(moves, src)))
+            return infos, results, cache, moves, comparisons
+
+        def done(result):
+            self.infos, self.results, self.probe_cache, self.source_moves, self.comparisons = result
+            self._set_busy(False)
+            for i, cmp in enumerate(self.comparisons, start=1):
+                if cmp.right_missing:
+                    self.log.appendPlainText(f"Pair {i}: destination doesn't exist yet, it will be created: "
+                                             f"{cmp.right_root}")
+            self.replan(reset_overrides=True)
+            n = sum(len(c.rows) for c in self.comparisons)
+            self.log.appendPlainText(f"Compared {n} files in {len(self.comparisons)} folder pair(s)")
+
+        def failed(msg):
+            self._set_busy(False)
+            self.mark_stale("Compare cancelled." if msg == "Cancelled" else "Compare failed.")
+            if msg != "Cancelled":
+                self.error(f"Compare failed: {msg}")
+
+        def progress(d, t):
+            if t:
+                self.progress.setRange(0, t)
+                self.progress.setValue(d)
+            else:
+                self.progress.setRange(0, 0)
+            self.progress_text.setText(self._last)
+
+        run_task(work, done, failed, progress)
+
+    def replan(self, reset_overrides: bool = False) -> None:
+        """Default actions for the sync mode, codec info per row, and holds for failing files."""
+        if not self.comparisons:
             return
-        bad = len(s.failing())
-        self.scan_summary.setText(f"{len(s.files)} files scanned\n{len(s.files) - bad} pass · {bad} fail")
+        mode = Mode(self.mode.currentText())
+        problems = {m.src: m.problem for m in self.source_moves if m.problem}
+        for cmp in self.comparisons:
+            failing = set()
+            for r in cmp.rows:
+                if reset_overrides:
+                    r.overridden = False
+                r.meta.clear()
+                if r.left:
+                    path = cmp.left_root / r.left.actual
+                    res = self.results.get(path)
+                    r.meta.update(codec=res, info=self.infos.get(path), problem=problems.get(path, ""))
+                    if res is not None and not res.ok:
+                        failing.add(r.left.actual)
+            plan(cmp.rows, mode)
+            if self.policy.currentText() != POLICY_WARN:
+                hold(cmp.rows, failing, "failed the codec check")
+        self.model.set_comparisons(self.comparisons)
+        self._refresh_summary()
 
-    def after_moves(self, moves: list[fileops.Move]) -> None:
-        self.session.apply_moves(moves)
-        self.check_page.render()
-        self.rename_page.schedule_preview()
-        self.organize_page.schedule_preview()
-        self.sync_page.mark_stale("Files in a source folder changed: compare again.")
+    def _refresh_summary(self) -> None:
+        self._update_chips()
+        rows = self.all_rows()
+        acting = [r for r in rows if r.action != Action.NONE]
+        copies = [r for r in acting if r.action in (Action.TO_RIGHT, Action.TO_LEFT)]
+        deletes = [r for r in acting if r.action in (Action.DELETE_RIGHT, Action.DELETE_LEFT)]
+        renames = [m for m in self.source_moves if m.changes and not m.problem]
+        held = sum(r.held for r in rows)
+        conflicts = sum(r.conflict for r in rows)
+        parts = []
+        if copies:
+            parts.append(f"{len(copies)} TO COPY ({human(syncer.total_bytes(copies))})")
+        if deletes:
+            parts.append(f"{len(deletes)} TO REMOVE")
+        if renames:
+            parts.append(f"{len(renames)} TO RENAME")
+        if held:
+            parts.append(f"{held} HELD BACK")
+        if conflicts:
+            parts.append(f"{conflicts} CONFLICTS")
+        if not rows:
+            text, color = "NO FILES FOUND", theme.MUTED
+        elif not (copies or deletes or renames):
+            text = "  ·  ".join(["NOTHING TO DO"] + parts) if parts else "IN SYNC  ·  NOTHING TO DO"
+            color = theme.WARN if parts else theme.PASS
+        else:
+            text, color = "  ·  ".join(parts), theme.TEXT
+        self.summary.setText(text)
+        self.summary.setStyleSheet(f"color: {color};")
+        self._update_sync_button()
 
-    def _page_changed(self, index: int) -> None:
-        page = self.stack.widget(index)
-        if hasattr(page, "on_show"):
-            page.on_show()
+    # ================= grid context menu =================
+    def _menu(self, pos) -> None:
+        sel = sorted({i.row() for i in self.view.selectionModel().selectedRows()})
+        rows = [r for i in sel if (r := self.model.row_at(i))]
+        if not rows:
+            return
+        menu = QMenu(self)
+        labels = {
+            Action.TO_RIGHT: "Copy to destination  →",
+            Action.TO_LEFT: "Copy to source  ←",
+            Action.DELETE_RIGHT: "Delete from destination  ✕",
+            Action.DELETE_LEFT: "Delete from source  ✕",
+            Action.NONE: "Do nothing",
+        }
+        for act, text in labels.items():
+            fits = [r for r in rows if act in possible_actions(r)]
+            if fits:
+                a = QAction(f"{text}   ({len(fits)})", menu)
+                a.triggered.connect(lambda _=False, act=act, fits=fits: self._set_action(fits, act))
+                menu.addAction(a)
+        menu.addSeparator()
+        reset = QAction("Back to default", menu)
+        reset.triggered.connect(lambda: self._reset_rows(rows))
+        menu.addAction(reset)
+        menu.exec(self.view.viewport().mapToGlobal(pos))
 
+    def _set_action(self, rows: list[Row], act: Action) -> None:
+        for r in rows:
+            r.action, r.overridden, r.held, r.conflict = act, True, False, False
+        self.model.refilter()
+        self._refresh_summary()
+
+    def _reset_rows(self, rows: list[Row]) -> None:
+        for r in rows:
+            r.overridden = False
+        self.replan()
+
+    # ================= synchronize =================
+    def _remover(self):
+        choice = self.options["deletion"]
+        if choice == DEL_PERMANENT:
+            return syncer.delete_permanently
+        if choice == DEL_SYSTEM:
+            def to_trash(root: Path, rel: str) -> None:
+                ok = QFile.moveToTrash(str(root / rel))
+                if isinstance(ok, tuple):
+                    ok = ok[0]
+                if not ok:
+                    raise OSError(f"could not move {rel} to the Trash")
+            return to_trash
+        return syncer.TrashFolder()
+
+    def run_sync(self) -> None:
+        comparisons = self.comparisons
+        problems = self.problems() if comparisons else ["Compare first."]
+        if problems:
+            return self.error("\n".join(problems))
+        rows = self.all_rows()
+        acting = [r for r in rows if r.action != Action.NONE]
+        to_r = [r for r in acting if r.action == Action.TO_RIGHT]
+        to_l = [r for r in acting if r.action == Action.TO_LEFT]
+        dels = [r for r in acting if r.action in (Action.DELETE_RIGHT, Action.DELETE_LEFT)]
+        moves = [m for m in self.source_moves if m.changes and not m.problem]
+        lines = [f"{len(comparisons)} folder pair(s)"]
+        if moves:
+            lines.append(f"Rename / move {len(moves)} files in the source (UNDO RENAMES puts them back)")
+        lines.append(f"Copy {len(to_r)} files to the destination ({human(syncer.total_bytes(to_r))})")
+        if to_l:
+            lines.append(f"Copy {len(to_l)} files back to the source ({human(syncer.total_bytes(to_l))})")
+        if dels:
+            lines.append(f"Remove {len(dels)} files  →  {self.options['deletion'].lower()}")
+        if held := sum(r.held for r in rows):
+            lines.append(f"Hold back {held} files that failed the codec check")
+        if QMessageBox.question(self, "pxlsync", "\n".join(lines) + "\n\nStart?") != QMessageBox.StandardButton.Yes:
+            return
+        self.save_settings()
+        self.cancel_flag.clear()
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(0)
+        self._set_busy(True, "Syncing…")
+        remover = self._remover()
+        prune = Mode(self.mode.currentText()) == Mode.MIRROR
+        cancelled = self.cancel_flag.is_set
+        journal_dir = self.journal_dir()
+        grand_total = max(syncer.total_bytes(acting), 1)
+
+        def work(progress):
+            renamed = 0
+            if moves:
+                self._last = f"Renaming {len(moves)} files in the source…"
+                progress(0, 1000)
+                fileops.apply(moves, journal_dir)  # all or nothing, before anything is copied
+                renamed = len(moves)
+            total = syncer.SyncStats()
+            for i, cmp in enumerate(comparisons, start=1):
+                before = total.bytes
+
+                def say(done, _t, msg, before=before, i=i):
+                    self._last = f"Pair {i}: {msg}" if len(comparisons) > 1 else msg
+                    progress(int((before + done) * 1000 / grand_total), 1000)
+
+                stats = syncer.run(cmp, remover, say, cancelled, prune_empty_right_dirs=prune)
+                total.copied += stats.copied
+                total.deleted += stats.deleted
+                total.bytes += stats.bytes
+                total.errors += [f"pair {i}: {e}" for e in stats.errors] if len(comparisons) > 1 else stats.errors
+                if stats.cancelled:
+                    total.cancelled = True
+                    break
+            return renamed, total
+
+        def done(result):
+            renamed, stats = result
+            self._set_busy(False)
+            status = "cancelled" if stats.cancelled else "done"
+            self.log.appendPlainText(
+                f"■ Sync {status}: {renamed} renamed, {stats.copied} copied ({human(stats.bytes)}), "
+                f"{stats.deleted} removed, {len(stats.errors)} errors")
+            for e in stats.errors[:50]:
+                self.log.appendPlainText(f"  ✕ {e}")
+            self.run_compare()  # show the result, like FreeFileSync does
+
+        def failed(msg):
+            self._set_busy(False)
+            self.error(f"Sync stopped: {msg}")
+            self.run_compare()
+
+        def progress(d, _t):
+            self.progress.setValue(d)
+            self.progress_text.setText(self._last)
+
+        run_task(work, done, failed, progress)
+
+    def undo_renames(self) -> None:
+        journal = fileops.latest_journal(self.journal_dir())
+        if not journal:
+            return self.error("No renames to undo.")
+        n = len(json.loads(journal.read_text(encoding="utf-8")))
+        if QMessageBox.question(
+                self, "pxlsync", f"Put the {n} files renamed/moved by the last sync back where they were in the "
+                "source?\n(Copies already in the destination are not touched.)") != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            done = fileops.undo(journal)
+        except (OSError, RuntimeError) as exc:
+            return self.error(str(exc))
+        self.log.appendPlainText(f"Undid {done} renames in the source")
+        self.mark_stale("Renames undone: press COMPARE.")
+
+    # ================= verify =================
+    def verify(self) -> None:
+        """Probe the destination copies of media files and compare codecs with the source."""
+        if not self.ffprobe:
+            return self.error("ffprobe is not installed (brew install ffmpeg).")
+        pairs = []
+        for cmp in self.comparisons:
+            for r in cmp.rows:
+                if r.left and r.right and r.category == Category.EQUAL:
+                    src = cmp.left_root / r.left.actual
+                    if src in self.infos:
+                        pairs.append((src, cmp.right_root / r.right.rel))
+        if not pairs:
+            return self.error("Nothing to verify yet: sync first, then verify the copies that are in place.")
+        self.log.appendPlainText(f"Verifying {len(pairs)} media files in the destination…")
+        self.verify_btn.setEnabled(False)
+        keys = ("video_codec", "video_profile", "width", "height", "audio_codec")
+        ffprobe = self.ffprobe
+
+        def done(infos):
+            self.verify_btn.setEnabled(True)
+            bad = 0
+            for (s, d), di in zip(pairs, infos):
+                si = self.infos.get(s)
+                if di.error or (si and any(getattr(si, k) != getattr(di, k) for k in keys)):
+                    bad += 1
+                    self.log.appendPlainText(f"  ✕ {d}: {di.error or 'codec differs from source'}")
+            self.log.appendPlainText(f"■ Verify: {len(pairs) - bad} OK, {bad} problems" if bad
+                                     else f"■ Verify: all {len(pairs)} media files match the source")
+
+        def failed(msg):
+            self.verify_btn.setEnabled(True)
+            self.log.appendPlainText(f"Verify failed: {msg}")
+
+        run_task(lambda p: probe_many([d for _, d in pairs], ffprobe, p), done, failed)
+
+    # ================= settings =================
     def save_settings(self) -> None:
         s = self.settings
         s.setValue("pairs", json.dumps(self.pairs_panel.pairs()))
         s.setValue("project", self.project_edit.text())
         s.setValue("client", self.client_edit.text())
-        for page in (self.check_page, self.rename_page, self.organize_page, self.sync_page):
-            page.save(s)
-
-    def closeEvent(self, event) -> None:  # noqa: N802 (Qt name)
-        self.save_settings()
-        super().closeEvent(event)
-
-
-class Page(QWidget):
-    def __init__(self, app: MainWindow, title: str, blurb: str):
-        super().__init__()
-        self.app = app
-        self.lay = QVBoxLayout(self)
-        self.lay.setContentsMargins(26, 20, 26, 20)
-        self.lay.setSpacing(12)
-        self.title_label = label(title.upper(), "appname")
-        self.lay.addWidget(self.title_label)
-        self.blurb_label = label(blurb, "hint")
-        self.blurb_label.setWordWrap(True)
-        self.lay.addWidget(self.blurb_label)
-        self.lay.addSpacing(4)
-
-    def save(self, settings: QSettings) -> None:
-        pass
-
-
-# ============================== 01 CHECK ==============================
-class CheckPage(Page):
-    def __init__(self, app: MainWindow):
-        super().__init__(app, "Codec check", "Scan every source folder and flag each file that isn't in the codec this job needs.")
-        s = app.settings
-        self.video_combo = QComboBox()
-        self.video_combo.addItems([p.label for p in app.video_presets])
-        self.video_combo.setCurrentText(s.value("video_preset", ANY_LABEL))
-        self.audio_combo = QComboBox()
-        self.audio_combo.addItems([p.label for p in app.audio_presets])
-        self.audio_combo.setCurrentText(s.value("audio_preset", ANY_LABEL))
-        self.require_audio = QCheckBox("Audio required")
-        self.require_audio.setChecked(s.value("require_audio", False, type=bool))
-        for w in (self.video_combo, self.audio_combo):
-            w.setMinimumWidth(240)
-            w.currentTextChanged.connect(lambda _=None: self.recheck())
-        self.require_audio.toggled.connect(lambda _=None: self.recheck())
-        self.scan_btn = button("Scan source", "primary", self.scan)
-
-        self.lay.addLayout(row(section("Video codec"), self.video_combo, section("Audio codec"),
-                               self.audio_combo, self.require_audio, None, self.scan_btn, spacing=12))
-        self.progress = QProgressBar()
-        self.progress.setVisible(False)
-        self.lay.addWidget(self.progress)
-        self.summary = label("", "summary")
-        self.lay.addWidget(self.summary)
-        self.table = table(["Status", "File", "Video", "Profile", "Resolution", "FPS", "Audio", "Issue"], 7)
-        self.lay.addWidget(self.table, 1)
-        self.render()
-
-    def rule(self) -> CheckRule:
-        v = next(p for p in self.app.video_presets if p.label == self.video_combo.currentText())
-        a = next(p for p in self.app.audio_presets if p.label == self.audio_combo.currentText())
-        return CheckRule(video=v, audio=a, require_audio=self.require_audio.isChecked())
-
-    def scan(self) -> None:
-        roots = self.app.sources()
-        if not roots:
-            return self.app.error("Add at least one source folder at the top.")
-        missing = [str(r) for r in roots if not r.is_dir()]
-        if missing:
-            return self.app.error("These source folders don't exist:\n" + "\n".join(missing))
-        if not self.app.ffprobe:
-            return self.app.error(
-                "ffprobe was not found. Install ffmpeg (macOS: brew install ffmpeg, "
-                "Windows: winget install ffmpeg) or set PXLSYNC_FFPROBE to its path."
-            )
-        self.app.save_settings()
-        self.scan_btn.setEnabled(False)
-        self.progress.setVisible(True)
-        self.progress.setValue(0)
-        self.summary.setText("SCANNING…")
-        ffprobe = self.app.ffprobe
-
-        def work(progress):
-            files: list[Path] = []
-            for root in roots:
-                files += [f for f in scan_media(root) if f not in files]
-            return files, probe_many(files, ffprobe, progress)
-
-        def done(result):
-            files, infos = result
-            self.app.session = Session()
-            self.app.session.files = files
-            self.app.session.infos = {i.path: i for i in infos}
-            self.app.session.roots = roots
-            self._finish()
-            self.recheck()
-
-        def failed(msg):
-            self._finish()
-            self.app.error(f"Scan failed: {msg}")
-
-        def progress(d, t):
-            self.progress.setMaximum(t)
-            self.progress.setValue(d)
-
-        run_task(work, done, failed, progress)
-
-    def _finish(self) -> None:
-        self.scan_btn.setEnabled(True)
-        self.progress.setVisible(False)
-
-    def recheck(self) -> None:
-        sess = self.app.session
-        rule = self.rule()
-        sess.results = {p: check(sess.infos[p], rule) for p in sess.files if p in sess.infos}
-        self.render()
-        if hasattr(self.app, "sync_page"):
-            self.app.sync_page.codec_changed()
-        self.app.save_settings()
-
-    def render(self) -> None:
-        sess = self.app.session
-        rows = []
-        # failing files first, then by path
-        for path in sorted(sess.files, key=lambda p: (sess.results.get(p) is None or sess.results[p].ok, str(p))):
-            info, res = sess.infos.get(path), sess.results.get(path)
-            ok = res.ok if res else True
-            rel = self.app.display_path(path)
-            issue = "; ".join(res.reasons) if res else ""
-            rows.append([
-                cell("PASS" if ok else "FAIL", theme.PASS if ok else theme.FAIL, bold=True),
-                cell(rel, tip=str(path)),
-                cell(info.video_codec if info else ""),
-                cell(info.video_profile if info else ""),
-                cell(info.resolution if info else ""),
-                cell(info.fps_text if info else ""),
-                cell(info.audio_codec if info else ""),
-                cell(issue, theme.FAIL if issue else None, tip=issue or None),
-            ])
-        fill(self.table, rows)
-        bad = len(sess.failing())
-        if sess.files:
-            text = f"{len(sess.files)} FILES  ·  {len(sess.files) - bad} PASS  ·  {bad} FAIL"
-            self.summary.setStyleSheet(f"color: {theme.FAIL if bad else theme.PASS};")
-        else:
-            text = "NO FILES SCANNED"
-            self.summary.setStyleSheet(f"color: {theme.MUTED};")
-        self.summary.setText(text)
-        self.app.update_scan_summary() if hasattr(self.app, "scan_summary") else None
-
-    def save(self, s: QSettings) -> None:
         s.setValue("video_preset", self.video_combo.currentText())
         s.setValue("audio_preset", self.audio_combo.currentText())
-        s.setValue("require_audio", self.require_audio.isChecked())
-
-
-# ============================== 02 RENAME ==============================
-class MovePage(Page):
-    """Shared preview / apply / undo for RENAME and ORGANIZE."""
-
-    noun = "files"
-
-    def __init__(self, app, title, blurb):
-        super().__init__(app, title, blurb)
-        self.moves: list[fileops.Move] = []
-        self.timer = QTimer(self, singleShot=True, interval=250)
-        self.timer.timeout.connect(self.preview)
-
-    def schedule_preview(self) -> None:
-        self.timer.start()
-
-    def on_show(self) -> None:
-        self.preview()
-
-    def plan(self) -> list[fileops.Move]:
-        raise NotImplementedError
-
-    def preview(self) -> None:
-        if not self.app.session.files:
-            fill(self.preview_table, [])
-            self.status.setText("Scan the source folders in 01 CHECK to see a preview.")
-            self.apply_btn.setEnabled(False)
-            return
-        try:
-            self.moves = self.plan()
-        except TemplateError as exc:
-            self.moves = []
-            fill(self.preview_table, [])
-            self.status.setText(f"Template problem: {exc}")
-            self.status.setStyleSheet(f"color: {theme.FAIL};")
-            self.apply_btn.setEnabled(False)
-            return
-        rel = self.app.display_path
-        rows = []
-        for m in sorted(self.moves, key=lambda m: (not m.problem, not m.changes, str(m.src))):
-            note, color = ("", theme.MUTED)
-            if m.problem:
-                note, color = m.problem, theme.FAIL
-            elif m.changes:
-                note, color = "will change", theme.PASS
-            else:
-                note = "no change"
-            rows.append([cell(rel(m.src)), cell(rel(m.dst), theme.TEXT if m.changes else theme.MUTED),
-                         cell(note, color)])
-        fill(self.preview_table, rows)
-        changing = [m for m in self.moves if m.changes and not m.problem]
-        problems = [m for m in self.moves if m.problem]
-        self.status.setText(f"{len(changing)} {self.noun} will change  ·  {len(problems)} blocked")
-        self.status.setStyleSheet(f"color: {theme.FAIL if problems else theme.TEXT};")
-        self.apply_btn.setEnabled(bool(changing))
-
-    def apply(self) -> None:
-        changing = [m for m in self.moves if m.changes and not m.problem]
-        if not changing:
-            return
-        if QMessageBox.question(self, "pxlsync", f"Change {len(changing)} {self.noun} in the source folder?\n"
-                                "You can undo this with UNDO LAST.") != QMessageBox.StandardButton.Yes:
-            return
-        try:
-            fileops.apply(self.moves, self.app.journal_dir())
-        except OSError as exc:
-            return self.app.error(f"Nothing was changed: {exc}")
-        self.app.after_moves(self.moves)
-        self.app.statusBar().showMessage(f"{len(changing)} {self.noun} changed", 6000)
-
-    def undo(self) -> None:
-        journal = fileops.latest_journal(self.app.journal_dir())
-        if not journal:
-            return self.app.error("Nothing to undo.")
-        entries = json.loads(journal.read_text(encoding="utf-8"))
-        if QMessageBox.question(self, "pxlsync", f"Undo the last change ({len(entries)} files)?") \
-                != QMessageBox.StandardButton.Yes:
-            return
-        try:
-            n = fileops.undo(journal)
-        except (OSError, RuntimeError) as exc:
-            return self.app.error(str(exc))
-        back = [fileops.Move(Path(e["dst"]), Path(e["src"])) for e in entries]
-        self.app.after_moves(back)
-        self.app.statusBar().showMessage(f"Undid {n} changes", 6000)
-
-    def add_preview_area(self, headers: list[str]) -> None:
-        self.status = label("", "summary")
-        self.apply_btn = button("Apply", "primary", self.apply)
-        self.lay.addLayout(row(self.status, None, button("Undo last", "ghost", self.undo), self.apply_btn))
-        self.preview_table = table(headers, 1)
-        self.lay.addWidget(self.preview_table, 1)
-
-    def target_files(self) -> list[Path]:
-        sess = self.app.session
-        if self.only_passing.isChecked():
-            return [p for p in sess.files if sess.results.get(p) is None or sess.results[p].ok]
-        return list(sess.files)
-
-
-class RenamePage(MovePage):
-    noun = "names"
-
-    def __init__(self, app: MainWindow):
-        super().__init__(app, "Version naming",
-                         "Rename files to the studio naming scheme. Version numbers continue from what "
-                         "already exists in the source and destination, so nothing gets overwritten.")
-        s = app.settings
-        self.template = QComboBox()
-        self.template.setEditable(True)
-        self.template.addItems(RENAME_PRESETS)
-        self.template.setCurrentText(s.value("rename_template", RENAME_PRESETS[0]))
-        self.template.currentTextChanged.connect(lambda _=None: self.schedule_preview())
-        self.lay.addLayout(row(section("Template"), self.template, stretch_at=1, spacing=12))
-
-        chips = QHBoxLayout()
-        chips.setSpacing(4)
-        chips.addWidget(label("insert:", "hint"))
-        for t in TOKENS:
-            chips.addWidget(button(t, "chip", lambda _=False, t=t: self._insert(t)))
-        chips.addStretch(1)
-        self.lay.addLayout(chips)
-
-        self.strip = QCheckBox("Drop old version tags from {name} (shot_v002 → shot)")
-        self.strip.setChecked(s.value("rename_strip", True, type=bool))
-        self.lower_ext = QCheckBox("Lowercase extensions")
-        self.lower_ext.setChecked(s.value("rename_lower_ext", False, type=bool))
-        self.only_passing = QCheckBox("Only files that passed the codec check")
-        self.only_passing.setChecked(s.value("rename_only_passing", False, type=bool))
-        for c in (self.strip, self.lower_ext, self.only_passing):
-            c.toggled.connect(lambda _=None: self.schedule_preview())
-        self.lay.addLayout(row(self.strip, self.lower_ext, self.only_passing, None, spacing=20))
-        self.lay.addWidget(hrule())
-        self.add_preview_area(["Current name", "New name", "Note"])
-        self.apply_btn.setText("APPLY RENAMES")
-
-    def _insert(self, token: str) -> None:
-        self.template.lineEdit().insert(token)
-        self.template.setFocus()
-
-    def plan(self) -> list[fileops.Move]:
-        known = existing_names(*self.app.session.roots, *self.app.dests())
-        return plan_renames(
-            self.target_files(), self.template.currentText(), self.app.fields(),
-            infos=self.app.session.infos, strip_version=self.strip.isChecked(),
-            known_names=known, lowercase_ext=self.lower_ext.isChecked(),
-        )
-
-    def save(self, s: QSettings) -> None:
+        s.setValue("sync_mode", self.mode.currentText())
+        s.setValue("sync_policy", self.policy.currentText())
+        s.setValue("rename_on", self.rename_chk.isChecked())
         s.setValue("rename_template", self.template.currentText())
-        s.setValue("rename_strip", self.strip.isChecked())
-        s.setValue("rename_lower_ext", self.lower_ext.isChecked())
-        s.setValue("rename_only_passing", self.only_passing.isChecked())
+        s.setValue("organize_on", self.organize_chk.isChecked())
+        s.setValue("org_rules", json.dumps([r.to_dict() for r in self.rules]))
+        s.setValue("cmp_method", self.options["method"])
+        s.setValue("sync_deletion", self.options["deletion"])
+        s.setValue("sync_excludes", self.options["excludes"])
+        s.setValue("require_audio", self.options["require_audio"])
+        s.setValue("rename_strip", self.options["strip_version"])
+        s.setValue("rename_lower_ext", self.options["lowercase_ext"])
 
-
-# ============================== 03 ORGANIZE ==============================
-class OrganizePage(MovePage):
-    def __init__(self, app: MainWindow):
-        super().__init__(app, "Organize",
-                         "Sort files into folders inside the source before syncing. Rules run top to "
-                         "bottom; the first match wins. Folder templates use the same tokens as RENAME, "
-                         "and / makes sub-folders.")
-        self.rules_table = table(["Match files", "Only codec", "Move to folder"], 2)
-        self.rules_table.setEditTriggers(self.rules_table.EditTrigger.AllEditTriggers)
-        self.rules_table.setMaximumHeight(190)
-        self.rules_table.itemChanged.connect(lambda _=None: self.schedule_preview())
-        self.only_passing = QCheckBox("Only files that passed the codec check")
-        self.only_passing.setChecked(app.settings.value("org_only_passing", False, type=bool))
-        self.only_passing.toggled.connect(lambda _=None: self.schedule_preview())
-        self.lay.addLayout(row(section("Rules"), None, self.only_passing,
-                               button("+ Add rule", "ghost", self.add_rule),
-                               button("Remove", "ghost", self.remove_rule),
-                               button("▲", "ghost", lambda: self.move_rule(-1)),
-                               button("▼", "ghost", lambda: self.move_rule(1))))
-        self.lay.addWidget(self.rules_table)
-        saved = app.settings.value("org_rules", "")
-        try:
-            rules = [OrganizeRule(**r) for r in json.loads(saved)] if saved else list(DEFAULT_RULES)
-        except (ValueError, TypeError):
-            rules = list(DEFAULT_RULES)
-        for r in rules:
-            self.add_rule(r)
-        self.lay.addWidget(hrule())
-        self.add_preview_area(["File", "New location", "Note"])
-        self.noun = "files"
-        self.apply_btn.setText("APPLY MOVES")
-
-    def _codec_combo(self, value: str) -> QComboBox:
-        c = QComboBox()
-        c.addItem(ANY_LABEL)
-        c.addItems([p.label for p in self.app.video_presets if not p.is_any])
-        c.addItems([p.label for p in self.app.audio_presets if not p.is_any])
-        c.setCurrentText(value or ANY_LABEL)
-        c.currentTextChanged.connect(lambda _=None: self.schedule_preview())
-        return c
-
-    def add_rule(self, rule: OrganizeRule | None = None) -> None:
-        rule = rule if isinstance(rule, OrganizeRule) else OrganizeRule("*.mov", "{kind}")
-        t = self.rules_table
-        r = t.rowCount()
-        t.blockSignals(True)
-        t.insertRow(r)
-        t.setItem(r, 0, cell(rule.pattern))
-        t.setCellWidget(r, 1, self._codec_combo(rule.codec))
-        t.setItem(r, 2, cell(rule.folder))
-        t.blockSignals(False)
-        self.schedule_preview()
-
-    def rules(self) -> list[OrganizeRule]:
-        t = self.rules_table
-        out = []
-        for r in range(t.rowCount()):
-            pat = t.item(r, 0).text().strip() if t.item(r, 0) else ""
-            folder = t.item(r, 2).text().strip() if t.item(r, 2) else ""
-            if pat and folder:
-                codec = t.cellWidget(r, 1).currentText()
-                out.append(OrganizeRule(pat, folder, "" if codec == ANY_LABEL else codec))
-        return out
-
-    def remove_rule(self) -> None:
-        r = self.rules_table.currentRow()
-        if r >= 0:
-            self.rules_table.removeRow(r)
-            self.schedule_preview()
-
-    def move_rule(self, delta: int) -> None:
-        t = self.rules_table
-        r = t.currentRow()
-        rules = self.rules()
-        if not (0 <= r < len(rules)) or not (0 <= r + delta < len(rules)):
-            return
-        rules[r], rules[r + delta] = rules[r + delta], rules[r]
-        t.setRowCount(0)
-        for rule in rules:
-            self.add_rule(rule)
-        t.selectRow(r + delta)
-
-    def plan(self) -> list[fileops.Move]:
-        # Each file is organized inside its own source folder.
-        by_root: dict[Path, list[Path]] = {}
-        for f in self.target_files():
-            by_root.setdefault(self.app.root_of(f), []).append(f)
-        moves: list[fileops.Move] = []
-        presets = self.app.video_presets + self.app.audio_presets
-        for root, files in by_root.items():
-            if root is not None:
-                moves += plan_organize(files, root, self.rules(), self.app.fields(), self.app.session.infos, presets)
-        return fileops.validate(moves)
-
-    def save(self, s: QSettings) -> None:
-        s.setValue("org_rules", json.dumps([r.to_dict() for r in self.rules()]))
-        s.setValue("org_only_passing", self.only_passing.isChecked())
-
-
-from .sync_page import SyncPage  # noqa: E402  (imports Page from this module)
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self.save_settings()
+        super().closeEvent(event)

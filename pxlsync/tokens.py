@@ -52,7 +52,10 @@ def kind_of(path: Path) -> str:
     return "other"
 
 
-def build_context(path: Path, info: MediaInfo | None, fields: dict[str, str]) -> dict[str, object]:
+def build_context(path: Path, info: MediaInfo | None, fields: dict[str, str],
+                  stat_path: Path | None = None) -> dict[str, object]:
+    """Token values for ``path``. ``stat_path`` is where the file really is, when ``path``
+    is a planned new name that doesn't exist yet (used for {mdate})."""
     ctx: dict[str, object] = {k: v for k, v in fields.items()}
     ctx.update(
         name=path.stem,
@@ -62,7 +65,7 @@ def build_context(path: Path, info: MediaInfo | None, fields: dict[str, str]) ->
         _now=datetime.now(),
     )
     try:
-        ctx["_mtime"] = datetime.fromtimestamp(path.stat().st_mtime)
+        ctx["_mtime"] = datetime.fromtimestamp((stat_path or path).stat().st_mtime)
     except OSError:
         ctx["_mtime"] = ctx["_now"]
     if info:

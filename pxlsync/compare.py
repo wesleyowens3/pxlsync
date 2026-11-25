@@ -65,6 +65,12 @@ class Entry:
     rel: str  # forward-slash relative path, original case
     size: int
     mtime: float
+    orig: str = ""  # current name when ``rel`` is a planned new name (rename / organize)
+
+    @property
+    def actual(self) -> str:
+        """Where the file is on disk right now."""
+        return self.orig or self.rel
 
 
 @dataclass
@@ -78,6 +84,7 @@ class Row:
     held: bool = False  # action switched off by a rule (e.g. failed codec check)
     overridden: bool = False  # action chosen by hand in the grid
     pair: int = 0  # which folder pair this row belongs to
+    meta: dict = field(default_factory=dict)  # extra info for the UI (codec result, ...)
 
     @property
     def rel(self) -> str:
@@ -171,7 +178,7 @@ def categorize(left: Entry, right: Entry, method: Method, left_root: Path, right
     if method == Method.CONTENT:
         if left.size != right.size:
             return Category.DIFFERENT
-        same = same_content(left_root / left.rel, right_root / right.rel, cancelled)
+        same = same_content(left_root / left.actual, right_root / right.actual, cancelled)
         return Category.EQUAL if same else Category.DIFFERENT
     dt = left.mtime - right.mtime
     if abs(dt) <= TIME_TOLERANCE:
@@ -187,13 +194,27 @@ def compare(
     progress: Callable[[str, int], None] | None = None,
     cancelled: Callable[[], bool] = lambda: False,
     pair: int = 0,
+    left_names: dict[str, str] | None = None,
 ) -> Comparison:
+    """Compare two folders.
+
+    ``left_names`` maps current source paths (relative, casefolded) to planned new
+    relative paths, so the comparison shows the result *after* renaming/organizing.
+    """
     excludes = DEFAULT_EXCLUDES + (excludes or [])
     result = Comparison(left_root, right_root,
                         left_missing=not left_root.is_dir(), right_missing=not right_root.is_dir())
     say = progress or (lambda _msg, _n: None)
     left = scan_tree(left_root, excludes, cancelled, lambda n: n % 200 == 0 and say("Scanning left", n))
     right = scan_tree(right_root, excludes, cancelled, lambda n: n % 200 == 0 and say("Scanning right", n))
+    if left_names:
+        renamed: dict[str, Entry] = {}
+        for key, e in left.items():
+            target = left_names.get(key)
+            if target and target != e.rel:
+                e = Entry(target, e.size, e.mtime, orig=e.rel)
+            renamed[e.rel.casefold()] = e
+        left = renamed
     keys = sorted(set(left) | set(right))
     for i, key in enumerate(keys):
         le, re_ = left.get(key), right.get(key)
@@ -246,7 +267,7 @@ def hold(rows: list[Row], rels: set[str], note: str) -> int:
     keys = {r.casefold() for r in rels}
     n = 0
     for row in rows:
-        if row.left and row.left.rel.casefold() in keys and row.action == Action.TO_RIGHT and not row.overridden:
+        if row.left and row.left.actual.casefold() in keys and row.action == Action.TO_RIGHT and not row.overridden:
             row.action, row.held, row.note = Action.NONE, True, note
             n += 1
     return n

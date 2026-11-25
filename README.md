@@ -1,19 +1,29 @@
 # pxlsync
 
-PXLBOX's media sync tool. Four steps, one window.
+PXLBOX's media sync tool: one screen, laid out like FreeFileSync.
 
-**Folder pairs** sit at the top, FreeFileSync-style: source folders on the left, destination
-folders on the right. **+** adds a pair, **−** removes one, **⇄** swaps a pair (the one in the
-header swaps them all). Type a path, **BROWSE**, or drag a folder from Finder/Explorer onto a field.
-Every step works across all pairs; the same source can go to several destinations
-(e.g. the NAS and a backup drive).
+![pxlsync](docs/one_screen.png)
 
-| Step | What it does |
-|---|---|
-| **01 CHECK** | Scans the source with `ffprobe`. Pick the required video and audio codec from dropdowns (ProRes 422 HQ, DNxHR HQ, H.264 High, PCM 24-bit, …). Every file is marked PASS or FAIL with the reason. |
-| **02 RENAME** | Renames to a template such as `{project}_{name}_v{v:3}`. Version numbers continue from what already exists in the source **and** destination, so `v003` on the server makes the next file `v004`. Live preview, conflict detection, undo. |
-| **03 ORGANIZE** | Rules like `*.mov;*.mp4` + `ProRes (any)` → `{date:%Y-%m-%d}/VIDEO/{codec:upper}`. First match wins. Preview and undo. |
-| **04 COMPARE+SYNC** | Side-by-side compare of every pair, grouped under a header line per pair, like FreeFileSync: every file shows NEW / UPDATE / DELETE / CONFLICT / HELD. Filter with the chips, right-click to change any row's action, then **SYNCHRONIZE**. Modes: Mirror, Update, Two way. Files that failed the codec check can **block** the sync, be **held back**, or sync anyway. **Verify destination** probes the copies and compares codecs with the source. |
+1. **Folder pairs** at the top: sources on the left, destinations on the right. **+** adds a pair,
+   **−** removes one, **⇄** swaps (the header one swaps all). Type, **BROWSE**, or drag a folder in.
+   One source can go to several destinations (e.g. the NAS and a backup drive).
+2. **Toolbar**
+   - **CODEC**: the video and audio codec every file must use (ProRes 422 HQ, DNxHR HQ, H.264 High,
+     PCM 24-bit, ...), and what happens to files that fail: block the sync, hold them back, or sync anyway.
+   - **SYNC**: Mirror → (destination becomes an exact copy), Update → (copy new/changed, never delete),
+     Two way ⇄ (newer wins).
+   - **RENAME**: tick it and pick a template such as `{project}_{name}_v{v:3}`. Version numbers
+     continue from what already exists in the sources and destinations.
+   - **ORGANIZE**: tick it to sort files into folders, e.g. `{mdate:%Y-%m-%d}/VIDEO/{codec:upper}`.
+     **EDIT RULES** to change them.
+   - **⚙ OPTIONS**: compare method, where removed files go, ignore list, rename details.
+3. **COMPARE** checks every codec (results are cached, so re-comparing is quick), works out the new
+   names and folders, and compares every pair. The grid shows each file's codec (PASS/FAIL and
+   format), its NEW NAME, and the ACTION: NEW / UPDATE / DELETE / CONFLICT / HELD. Filter with the
+   chips; right-click rows to change their action.
+4. **SYNCHRONIZE** renames/moves the files in the source (one undoable step: **UNDO RENAMES**), then
+   copies, then compares again so you see the result. **VERIFY DESTINATION** re-reads the copies and
+   checks their codecs match the source.
 
 ## Requirements on each workstation
 
@@ -28,7 +38,7 @@ Only **ffprobe** (part of ffmpeg) for the codec check, unless it's bundled into 
 python3 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements-dev.txt
 python run_pxlsync.py
-python -m pytest            # 13 tests, uses real ffmpeg-encoded clips
+python -m pytest            # 15 tests, uses real ffmpeg-encoded clips
 ```
 
 ## macOS installer (.dmg)
@@ -77,7 +87,7 @@ cross-compile).
   ```
   ffprobe names: `prores` (profiles `Proxy`, `LT`, `Standard`, `HQ`, `4444`, `XQ`),
   `dnxhd` (`DNXHD`, `DNXHR LB/SQ/HQ/HQX/444`), `h264`, `hevc`, `av1`, `pcm_s24le`, `aac`, …
-- **Ignore list**: extra patterns on the COMPARE+SYNC page, e.g. `*.tmp; *.lrf; Proxies/`
+- **Ignore list** (⚙ OPTIONS): extra patterns, e.g. `*.tmp; *.lrf; Proxies/`
   (a trailing `/` means a folder). `.DS_Store`, `._*`, `Thumbs.db` and system folders are always ignored.
 - **Rename tokens**: `{project} {client} {name} {ext} {folder} {date} {date:%Y-%m-%d} {mdate}
   {v} {v:3} {seq:4} {codec} {profile} {res} {w} {h} {fps} {kind}`, plus `:upper` / `:lower`
@@ -87,7 +97,8 @@ cross-compile).
 
 - Renames and moves are journaled before any file is touched (config folder → `journals/`), roll back
   automatically if something fails halfway, and **UNDO LAST** reverses the latest batch.
-- A file already named per the template is left alone.
+- A file already named per the template is left alone, and organizing by the file's own date
+  (`{mdate}`) keeps files where they are on later syncs. Files that fail the codec check are not renamed.
 - Nothing is copied until you press **SYNCHRONIZE** and confirm a summary of what will happen.
 - Copies are written to `name.pxlsync-part` and renamed into place only when complete, so a
   cancelled or failed copy never leaves a broken file under the real name. Modification times are
@@ -111,7 +122,10 @@ pxlsync/organize.py   rule-based folder planner
 pxlsync/fileops.py    journaled moves and undo
 pxlsync/compare.py    folder compare and sync-mode planning
 pxlsync/syncer.py     copy / remove engine (safe partial files, trash folder, cancel)
+pxlsync/pipeline.py   combined rename + organize plan used by compare and sync
 pxlsync/ui/pairs.py   folder pair panel (drag & drop, add/remove/swap)
+pxlsync/ui/grid.py    compare grid model
+pxlsync/ui/dialogs.py organize rules and options dialogs
 pxlsync/ui/           PySide6 interface and PXLBOX theme
 ```
 
