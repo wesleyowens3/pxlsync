@@ -1,13 +1,19 @@
 # pxlsync
 
-PXLBOX's media sync tool. Four steps, one window:
+PXLBOX's media sync tool. Four steps, one window.
+
+**Folder pairs** sit at the top, FreeFileSync-style: source folders on the left, destination
+folders on the right. **+** adds a pair, **−** removes one, **⇄** swaps a pair (the one in the
+header swaps them all). Type a path, **BROWSE**, or drag a folder from Finder/Explorer onto a field.
+Every step works across all pairs; the same source can go to several destinations
+(e.g. the NAS and a backup drive).
 
 | Step | What it does |
 |---|---|
 | **01 CHECK** | Scans the source with `ffprobe`. Pick the required video and audio codec from dropdowns (ProRes 422 HQ, DNxHR HQ, H.264 High, PCM 24-bit, …). Every file is marked PASS or FAIL with the reason. |
 | **02 RENAME** | Renames to a template such as `{project}_{name}_v{v:3}`. Version numbers continue from what already exists in the source **and** destination, so `v003` on the server makes the next file `v004`. Live preview, conflict detection, undo. |
 | **03 ORGANIZE** | Rules like `*.mov;*.mp4` + `ProRes (any)` → `{date:%Y-%m-%d}/VIDEO/{codec:upper}`. First match wins. Preview and undo. |
-| **04 COMPARE+SYNC** | Side-by-side compare of source (left) and destination (right), like FreeFileSync: every file shows NEW / UPDATE / DELETE / CONFLICT / HELD. Filter with the chips, right-click to change any row's action, then **SYNCHRONIZE**. Modes: Mirror, Update, Two way. Files that failed the codec check can **block** the sync, be **held back**, or sync anyway. **Verify destination** probes the copies and compares codecs with the source. |
+| **04 COMPARE+SYNC** | Side-by-side compare of every pair, grouped under a header line per pair, like FreeFileSync: every file shows NEW / UPDATE / DELETE / CONFLICT / HELD. Filter with the chips, right-click to change any row's action, then **SYNCHRONIZE**. Modes: Mirror, Update, Two way. Files that failed the codec check can **block** the sync, be **held back**, or sync anyway. **Verify destination** probes the copies and compares codecs with the source. |
 
 ## Requirements on each workstation
 
@@ -61,6 +67,8 @@ right-click → Open the first time; sign and notarize for wider rollout.
   (or the system Trash, or permanent delete, your choice).
 - Times within 2 seconds count as equal (exFAT/FAT32 drives round to 2 s); paths match ignoring case.
 - With *Block the sync*, SYNCHRONIZE stays disabled while any file being copied failed the codec check.
+- Pair setups that would clobber data are refused: a destination equal to or inside its source, two
+  pairs writing to the same destination, or a destination inside another pair's source.
 
 ## Layout
 
@@ -74,6 +82,7 @@ pxlsync/organize.py   rule-based folder planner
 pxlsync/fileops.py    journaled moves and undo
 pxlsync/compare.py    folder compare and sync-mode planning
 pxlsync/syncer.py     copy / remove engine (safe partial files, trash folder, cancel)
+pxlsync/ui/pairs.py   folder pair panel (drag & drop, add/remove/swap)
 pxlsync/ui/           PySide6 interface and PXLBOX theme
 ```
 

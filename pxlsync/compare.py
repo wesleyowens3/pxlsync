@@ -77,6 +77,7 @@ class Row:
     conflict: bool = False
     held: bool = False  # action switched off by a rule (e.g. failed codec check)
     overridden: bool = False  # action chosen by hand in the grid
+    pair: int = 0  # which folder pair this row belongs to
 
     @property
     def rel(self) -> str:
@@ -185,6 +186,7 @@ def compare(
     excludes: list[str] | None = None,
     progress: Callable[[str, int], None] | None = None,
     cancelled: Callable[[], bool] = lambda: False,
+    pair: int = 0,
 ) -> Comparison:
     excludes = DEFAULT_EXCLUDES + (excludes or [])
     result = Comparison(left_root, right_root,
@@ -204,7 +206,7 @@ def compare(
                 cat = Category.DIFFERENT
         else:
             cat = Category.LEFT_ONLY if le else Category.RIGHT_ONLY
-        result.rows.append(Row(le, re_, cat))
+        result.rows.append(Row(le, re_, cat, pair=pair))
     return result
 
 

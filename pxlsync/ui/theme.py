@@ -107,6 +107,12 @@ QMenu::item {{ padding: 6px 18px; }}
 QMenu::item:selected {{ background: {TEXT}; color: {BG}; }}
 QMenu::separator {{ height: 1px; background: {LINE}; margin: 4px 8px; }}
 
+QPushButton#icon {{ border: 1px solid {LINE}; padding: 0; min-width: 28px; max-width: 28px; min-height: 28px; max-height: 28px; font-size: 13pt; }}
+QPushButton#icon:hover {{ border-color: {TEXT}; }}
+QLabel#pairnum {{ color: {MUTED}; border: 1px solid {LINE}; min-width: 22px; max-width: 22px; min-height: 28px; font-weight: bold; }}
+QLineEdit[drop="true"] {{ border: 1px dashed {TEXT}; background: {BOX}; }}
+QScrollArea {{ background: transparent; }}
+
 QPushButton#nav {{
     text-align: left; border: none; border-left: 2px solid transparent;
     padding: 12px 18px; color: {MUTED}; letter-spacing: 2px;

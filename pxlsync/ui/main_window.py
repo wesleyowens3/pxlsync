@@ -8,7 +8,7 @@ from pathlib import Path
 from PySide6.QtCore import QSettings, QStandardPaths, Qt, QTimer
 from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import (
-    QButtonGroup, QCheckBox, QComboBox, QFileDialog, QGridLayout, QHBoxLayout,
+    QButtonGroup, QCheckBox, QComboBox, QHBoxLayout,
     QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar,
     QStackedWidget, QVBoxLayout, QWidget,
 )
@@ -21,6 +21,7 @@ from ..probe import MediaInfo, find_ffprobe, probe_many, scan_media
 from ..rename import existing_names, plan_renames
 from ..tokens import TemplateError
 from . import theme
+from .pairs import FolderPairs
 from .widgets import button, cell, fill, hrule, label, row, run_task, section, table, vrule
 
 
@@ -45,6 +46,7 @@ class Session:
 
     def __init__(self) -> None:
         self.files: list[Path] = []
+        self.roots: list[Path] = []  # source folders the scan covered
         self.infos: dict[Path, MediaInfo] = {}
         self.results: dict[Path, CheckResult] = {}
 
@@ -124,42 +126,29 @@ class MainWindow(QMainWindow):
         lay.addSpacing(10)
         lay.addWidget(label(f"v{__version__}", "tag"), 0, Qt.AlignmentFlag.AlignVCenter)
         lay.addStretch(1)
-        lay.addWidget(label("check · rename · organize · sync", "muted"))
-        return w
-
-    def _folder_bar(self) -> QWidget:
-        w = QWidget()
-        grid = QGridLayout(w)
-        grid.setContentsMargins(22, 14, 22, 14)
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(8)
-        self.source_edit = QLineEdit(self.settings.value("source", ""))
-        self.source_edit.setPlaceholderText("Folder with the media to send")
-        self.dest_edit = QLineEdit(self.settings.value("dest", ""))
-        self.dest_edit.setPlaceholderText("Where it should end up (NAS, drive, server share)")
         self.project_edit = QLineEdit(self.settings.value("project", ""))
         self.project_edit.setPlaceholderText("e.g. PXL0142")
         self.client_edit = QLineEdit(self.settings.value("client", ""))
         self.client_edit.setPlaceholderText("e.g. ACME")
-        for e in (self.project_edit, self.client_edit):
-            e.setFixedWidth(170)
+        for title, e in (("Project", self.project_edit), ("Client", self.client_edit)):
+            e.setFixedWidth(160)
             e.textChanged.connect(lambda _=None: self.fields_changed())
-        self.source_edit.editingFinished.connect(self._source_changed)
-        self.dest_edit.editingFinished.connect(self._dest_changed)
-
-        grid.addWidget(section("Source"), 0, 0)
-        grid.addWidget(self.source_edit, 0, 1)
-        grid.addWidget(button("Browse", "ghost", lambda: self._pick(self.source_edit)), 0, 2)
-        grid.addWidget(section("Project"), 0, 3)
-        grid.addWidget(self.project_edit, 0, 4)
-        grid.addWidget(section("Destination"), 1, 0)
-        grid.addWidget(self.dest_edit, 1, 1)
-        grid.addWidget(button("Browse", "ghost", lambda: self._pick(self.dest_edit)), 1, 2)
-        grid.addWidget(section("Client"), 1, 3)
-        grid.addWidget(self.client_edit, 1, 4)
-        grid.setColumnStretch(1, 1)
-        grid.setColumnMinimumWidth(3, 90)
+            lay.addWidget(section(title))
+            lay.addWidget(e)
+            lay.addSpacing(12)
         return w
+
+    def _folder_bar(self) -> QWidget:
+        saved = self.settings.value("pairs", "")
+        try:
+            pairs = [tuple(p) for p in json.loads(saved)] if saved else []
+        except ValueError:
+            pairs = []
+        if not pairs:  # settings from before folder pairs existed
+            pairs = [(self.settings.value("source", ""), self.settings.value("dest", ""))]
+        self.pairs_panel = FolderPairs(pairs)
+        self.pairs_panel.changed.connect(self._pairs_changed)
+        return self.pairs_panel
 
     def _nav(self, names: list[str]) -> QWidget:
         w = QWidget()
@@ -182,40 +171,52 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.scan_summary)
         return w
 
-    # ---------- shared helpers ----------
-    def _pick(self, edit: QLineEdit) -> None:
-        d = QFileDialog.getExistingDirectory(self, "Choose folder", edit.text() or str(Path.home()))
-        if d:
-            edit.setText(d)
-            if edit is self.source_edit:
-                self._source_changed()
-            else:
-                self._dest_changed()
-            self.save_settings()
-
-    def _dest_changed(self) -> None:
+    # ---------- folder pairs ----------
+    def _pairs_changed(self) -> None:
         if hasattr(self, "sync_page"):
-            self.sync_page.mark_stale("Destination changed: compare again.")
-        self.save_settings()
-
-    def _source_changed(self) -> None:
-        if hasattr(self, "sync_page"):
-            self.sync_page.mark_stale("Source changed: compare again.")
-        if self.session.files and Path(self.source_edit.text()) != self.scanned_root:
+            self.sync_page.mark_stale("Folders changed: compare again.")
+        if self.session.files and not self.scan_current():
             self.session = Session()
             self.check_page.render()
             self.update_scan_summary()
+        self.rename_page.schedule_preview() if hasattr(self, "rename_page") else None
         self.save_settings()
 
-    scanned_root: Path | None = None
+    def pairs(self) -> list[tuple[Path | None, Path | None]]:
+        """Folder pairs that aren't completely empty."""
+        out = []
+        for left, right in self.pairs_panel.pairs():
+            if left or right:
+                out.append((Path(left) if left else None, Path(right) if right else None))
+        return out
 
-    def source(self) -> Path | None:
-        t = self.source_edit.text().strip()
-        return Path(t) if t else None
+    def sources(self) -> list[Path]:
+        seen: list[Path] = []
+        for left, _ in self.pairs():
+            if left and left not in seen:
+                seen.append(left)
+        return seen
 
-    def dest(self) -> Path | None:
-        t = self.dest_edit.text().strip()
-        return Path(t) if t else None
+    def dests(self) -> list[Path]:
+        return [r for _, r in self.pairs() if r]
+
+    def scan_current(self) -> bool:
+        """True when the last codec scan covered exactly today's source folders."""
+        return bool(self.session.roots) and self.session.roots == self.sources()
+
+    def root_of(self, path: Path) -> Path | None:
+        best = None
+        for root in self.session.roots:
+            if path.is_relative_to(root) and (best is None or len(root.parts) > len(best.parts)):
+                best = root
+        return best
+
+    def display_path(self, path: Path) -> str:
+        root = self.root_of(path)
+        if not root:
+            return str(path)
+        rel = path.relative_to(root).as_posix()
+        return f"{root.name}/{rel}" if len(self.session.roots) > 1 else rel
 
     def fields(self) -> dict[str, str]:
         return {"project": self.project_edit.text().strip(), "client": self.client_edit.text().strip()}
@@ -230,7 +231,7 @@ class MainWindow(QMainWindow):
     def need_scan(self) -> bool:
         if self.session.files:
             return False
-        QMessageBox.information(self, "pxlsync", "Scan the source folder first (01 CHECK).")
+        QMessageBox.information(self, "pxlsync", "Scan the source folders first (01 CHECK).")
         self.nav_group.button(0).click()
         return True
 
@@ -253,7 +254,7 @@ class MainWindow(QMainWindow):
         self.check_page.render()
         self.rename_page.schedule_preview()
         self.organize_page.schedule_preview()
-        self.sync_page.mark_stale("Files in the source changed: compare again.")
+        self.sync_page.mark_stale("Files in a source folder changed: compare again.")
 
     def _page_changed(self, index: int) -> None:
         page = self.stack.widget(index)
@@ -262,8 +263,7 @@ class MainWindow(QMainWindow):
 
     def save_settings(self) -> None:
         s = self.settings
-        s.setValue("source", self.source_edit.text())
-        s.setValue("dest", self.dest_edit.text())
+        s.setValue("pairs", json.dumps(self.pairs_panel.pairs()))
         s.setValue("project", self.project_edit.text())
         s.setValue("client", self.client_edit.text())
         for page in (self.check_page, self.rename_page, self.organize_page, self.sync_page):
@@ -281,10 +281,11 @@ class Page(QWidget):
         self.lay = QVBoxLayout(self)
         self.lay.setContentsMargins(26, 20, 26, 20)
         self.lay.setSpacing(12)
-        self.lay.addWidget(label(title.upper(), "appname"))
-        hint = label(blurb, "hint")
-        hint.setWordWrap(True)
-        self.lay.addWidget(hint)
+        self.title_label = label(title.upper(), "appname")
+        self.lay.addWidget(self.title_label)
+        self.blurb_label = label(blurb, "hint")
+        self.blurb_label.setWordWrap(True)
+        self.lay.addWidget(self.blurb_label)
         self.lay.addSpacing(4)
 
     def save(self, settings: QSettings) -> None:
@@ -294,7 +295,7 @@ class Page(QWidget):
 # ============================== 01 CHECK ==============================
 class CheckPage(Page):
     def __init__(self, app: MainWindow):
-        super().__init__(app, "Codec check", "Scan the source and flag every file that isn't in the codec this job needs.")
+        super().__init__(app, "Codec check", "Scan every source folder and flag each file that isn't in the codec this job needs.")
         s = app.settings
         self.video_combo = QComboBox()
         self.video_combo.addItems([p.label for p in app.video_presets])
@@ -327,9 +328,12 @@ class CheckPage(Page):
         return CheckRule(video=v, audio=a, require_audio=self.require_audio.isChecked())
 
     def scan(self) -> None:
-        src = self.app.source()
-        if not src or not src.is_dir():
-            return self.app.error("Choose a source folder that exists.")
+        roots = self.app.sources()
+        if not roots:
+            return self.app.error("Add at least one source folder at the top.")
+        missing = [str(r) for r in roots if not r.is_dir()]
+        if missing:
+            return self.app.error("These source folders don't exist:\n" + "\n".join(missing))
         if not self.app.ffprobe:
             return self.app.error(
                 "ffprobe was not found. Install ffmpeg (macOS: brew install ffmpeg, "
@@ -343,7 +347,9 @@ class CheckPage(Page):
         ffprobe = self.app.ffprobe
 
         def work(progress):
-            files = scan_media(src)
+            files: list[Path] = []
+            for root in roots:
+                files += [f for f in scan_media(root) if f not in files]
             return files, probe_many(files, ffprobe, progress)
 
         def done(result):
@@ -351,7 +357,7 @@ class CheckPage(Page):
             self.app.session = Session()
             self.app.session.files = files
             self.app.session.infos = {i.path: i for i in infos}
-            self.app.scanned_root = src
+            self.app.session.roots = roots
             self._finish()
             self.recheck()
 
@@ -380,13 +386,12 @@ class CheckPage(Page):
 
     def render(self) -> None:
         sess = self.app.session
-        root = self.app.scanned_root
         rows = []
         # failing files first, then by path
         for path in sorted(sess.files, key=lambda p: (sess.results.get(p) is None or sess.results[p].ok, str(p))):
             info, res = sess.infos.get(path), sess.results.get(path)
             ok = res.ok if res else True
-            rel = path.relative_to(root).as_posix() if root and path.is_relative_to(root) else str(path)
+            rel = self.app.display_path(path)
             issue = "; ".join(res.reasons) if res else ""
             rows.append([
                 cell("PASS" if ok else "FAIL", theme.PASS if ok else theme.FAIL, bold=True),
@@ -439,7 +444,7 @@ class MovePage(Page):
     def preview(self) -> None:
         if not self.app.session.files:
             fill(self.preview_table, [])
-            self.status.setText("Scan the source in 01 CHECK to see a preview.")
+            self.status.setText("Scan the source folders in 01 CHECK to see a preview.")
             self.apply_btn.setEnabled(False)
             return
         try:
@@ -451,8 +456,7 @@ class MovePage(Page):
             self.status.setStyleSheet(f"color: {theme.FAIL};")
             self.apply_btn.setEnabled(False)
             return
-        root = self.app.scanned_root
-        rel = lambda p: p.relative_to(root).as_posix() if root and p.is_relative_to(root) else str(p)  # noqa: E731
+        rel = self.app.display_path
         rows = []
         for m in sorted(self.moves, key=lambda m: (not m.problem, not m.changes, str(m.src))):
             note, color = ("", theme.MUTED)
@@ -556,7 +560,7 @@ class RenamePage(MovePage):
         self.template.setFocus()
 
     def plan(self) -> list[fileops.Move]:
-        known = existing_names(*(p for p in (self.app.scanned_root, self.app.dest()) if p))
+        known = existing_names(*self.app.session.roots, *self.app.dests())
         return plan_renames(
             self.target_files(), self.template.currentText(), self.app.fields(),
             infos=self.app.session.infos, strip_version=self.strip.isChecked(),
@@ -653,8 +657,16 @@ class OrganizePage(MovePage):
         t.selectRow(r + delta)
 
     def plan(self) -> list[fileops.Move]:
-        return plan_organize(self.target_files(), self.app.scanned_root, self.rules(), self.app.fields(),
-                             self.app.session.infos, self.app.video_presets + self.app.audio_presets)
+        # Each file is organized inside its own source folder.
+        by_root: dict[Path, list[Path]] = {}
+        for f in self.target_files():
+            by_root.setdefault(self.app.root_of(f), []).append(f)
+        moves: list[fileops.Move] = []
+        presets = self.app.video_presets + self.app.audio_presets
+        for root, files in by_root.items():
+            if root is not None:
+                moves += plan_organize(files, root, self.rules(), self.app.fields(), self.app.session.infos, presets)
+        return fileops.validate(moves)
 
     def save(self, s: QSettings) -> None:
         s.setValue("org_rules", json.dumps([r.to_dict() for r in self.rules()]))

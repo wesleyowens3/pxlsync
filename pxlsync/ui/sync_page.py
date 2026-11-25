@@ -88,21 +88,43 @@ class CompareModel(QAbstractTableModel):
 
     def __init__(self) -> None:
         super().__init__()
+        self.comparisons: list[Comparison] = []
         self.rows: list[Row] = []
-        self.visible: list[Row] = []
+        self.visible: list[Row | int] = []  # an int is the header line of that folder pair
         self.shown = {k for k, *_ in BUCKETS} - {B_SAME}
-        self.codec: dict[str, bool] = {}  # rel.casefold() -> passed?
+        self.codec: dict[tuple[int, str], bool] = {}  # (pair, rel.casefold()) -> passed?
         self.bold = QFont()
         self.bold.setBold(True)
 
-    def set_rows(self, rows: list[Row]) -> None:
-        self.rows = rows
+    def set_rows(self, comparisons: list[Comparison]) -> None:
+        self.comparisons = comparisons
+        self.rows = [r for c in comparisons for r in c.rows]
         self.refilter()
 
     def refilter(self) -> None:
         self.beginResetModel()
-        self.visible = [r for r in self.rows if bucket(r) in self.shown]
+        self.visible = []
+        grouped = len(self.comparisons) > 1
+        for i, cmp in enumerate(self.comparisons):
+            if grouped:
+                self.visible.append(i)
+            self.visible += [r for r in cmp.rows if bucket(r) in self.shown]
         self.endResetModel()
+
+    def row_at(self, i: int) -> Row | None:
+        item = self.visible[i]
+        return None if isinstance(item, int) else item
+
+    def header_rows(self) -> list[int]:
+        return [n for n, item in enumerate(self.visible) if isinstance(item, int)]
+
+    def _header_text(self, i: int) -> str:
+        cmp = self.comparisons[i]
+        acting = [r for r in cmp.rows if r.action != Action.NONE]
+        copies = [r for r in acting if r.action in (Action.TO_RIGHT, Action.TO_LEFT)]
+        info = (f"{len(copies)} to copy ({human(syncer.total_bytes(copies))}) · {len(acting) - len(copies)} to remove"
+                if acting else "nothing to do")
+        return f"PAIR {i + 1}     {cmp.left_root}   →   {cmp.right_root}        {info}"
 
     def rowCount(self, parent=QModelIndex()) -> int:  # noqa: N802
         return 0 if parent.isValid() else len(self.visible)
@@ -118,8 +140,19 @@ class CompareModel(QAbstractTableModel):
         return None
 
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
-        r = self.visible[index.row()]
+        item = self.visible[index.row()]
         col = index.column()
+        if isinstance(item, int):  # folder pair header line
+            if role == Qt.ItemDataRole.DisplayRole and col == 0:
+                return self._header_text(item)
+            if role == Qt.ItemDataRole.FontRole:
+                return self.bold
+            if role == Qt.ItemDataRole.ForegroundRole:
+                return QColor(theme.TEXT)
+            if role == Qt.ItemDataRole.BackgroundRole:
+                return QColor(theme.BOX)
+            return None
+        r = item
         b = bucket(r)
         side = r.left if col < self.MID else r.right
         if role == Qt.ItemDataRole.DisplayRole:
@@ -128,7 +161,7 @@ class CompareModel(QAbstractTableModel):
                     return "←  UPDATE" if r.left else "←  NEW"
                 return ACTION_TEXT[b][0]
             if col == 3:
-                ok = self.codec.get(r.left.rel.casefold()) if r.left else None
+                ok = self.codec.get((r.pair, r.left.rel.casefold())) if r.left else None
                 return "" if ok is None else ("PASS" if ok else "FAIL")
             if side is None:
                 return ""
@@ -138,7 +171,7 @@ class CompareModel(QAbstractTableModel):
             if col == self.MID:
                 return QColor(theme.LEFT if b == B_LEFT else ACTION_TEXT[b][1])
             if col == 3:
-                ok = self.codec.get(r.left.rel.casefold()) if r.left else None
+                ok = self.codec.get((r.pair, r.left.rel.casefold())) if r.left else None
                 return QColor(theme.MUTED if ok is None else theme.PASS if ok else theme.FAIL)
             if b == B_SAME:
                 return QColor(theme.MUTED)
@@ -178,8 +211,12 @@ class SyncPage(Page):
         super().__init__(app, "Compare + sync",
                          "Source on the left, destination on the right. Nothing is copied until you press "
                          "SYNCHRONIZE. Right-click rows to change what happens to them.")
+        # Like FreeFileSync: no page title, the grid gets the room. The intro becomes a tooltip.
+        self.title_label.hide()
+        self.blurb_label.hide()
+        self.lay.setContentsMargins(26, 14, 26, 14)
         s = app.settings
-        self.comparison: Comparison | None = None
+        self.comparisons: list[Comparison] = []
         self.cancel_flag = threading.Event()
         self.busy = False
 
@@ -216,6 +253,8 @@ class SyncPage(Page):
         self.compare_btn = button("Compare", "primary", self.run_compare)
         self.sync_btn = button("Synchronize", "primary", self.run_sync)
         self.compare_btn.setMinimumWidth(150)
+        self.compare_btn.setToolTip("Compare every folder pair. Nothing is copied until you press SYNCHRONIZE.\n"
+                                    "Right-click rows in the grid to change what happens to them.")
         self.sync_btn.setMinimumWidth(170)
 
         grid = QGridLayout()
@@ -257,6 +296,7 @@ class SyncPage(Page):
         self.model = CompareModel()
         self.view = QTableView()
         self.view.setModel(self.model)
+        self.model.modelReset.connect(self._apply_spans)
         self.view.verticalHeader().setVisible(False)
         self.view.verticalHeader().setDefaultSectionSize(26)
         self.view.setShowGrid(False)
@@ -286,7 +326,7 @@ class SyncPage(Page):
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setPlaceholderText("Log")
-        self.log.setMaximumHeight(64)
+        self.log.setMaximumHeight(56)
         self.lay.addWidget(self.log)
         self.mark_stale("Press COMPARE to see what will be synced.")
 
@@ -301,8 +341,16 @@ class SyncPage(Page):
             w.setEnabled(not busy)
         self.update_sync_button()
 
+    def _apply_spans(self) -> None:
+        self.view.clearSpans()
+        for n in self.model.header_rows():
+            self.view.setSpan(n, 0, 1, self.model.columnCount())
+
+    def all_rows(self) -> list[Row]:
+        return [r for c in self.comparisons for r in c.rows]
+
     def mark_stale(self, message: str) -> None:
-        self.comparison = None
+        self.comparisons = []
         self.model.set_rows([])
         self.summary.setText(message.upper())
         self.progress_text.setText("") if hasattr(self, "progress_text") else None
@@ -314,7 +362,7 @@ class SyncPage(Page):
         self.update_sync_button()
 
     def codec_changed(self) -> None:
-        if self.comparison:
+        if self.comparisons:
             self.replan()
 
     def _toggle(self, key: str, on: bool) -> None:
@@ -326,37 +374,34 @@ class SyncPage(Page):
         for key, text, _ in BUCKETS:
             self.chips[key].setText(f"{text}  {counts[key]}")
 
-    def failing_rels(self) -> set[str]:
-        """Source-relative paths of files that failed the codec check (if it ran on this source)."""
-        sess, src = self.app.session, self.app.source()
-        if not sess.results or not src or self.app.scanned_root != src:
-            return set()
-        return {p.relative_to(src).as_posix() for p in sess.failing() if p.is_relative_to(src)}
-
-    def _codec_map(self) -> dict[str, bool]:
-        sess, src = self.app.session, self.app.source()
-        if not sess.results or not src or self.app.scanned_root != src:
-            return {}
-        return {p.relative_to(src).as_posix().casefold(): r.ok for p, r in sess.results.items()
-                if p.is_relative_to(src)}
+    def _codec_results(self, root: Path):
+        """(source-relative path, passed?) for scanned files inside ``root``."""
+        sess = self.app.session
+        if not sess.results or not self.app.scan_current():
+            return []
+        return [(p.relative_to(root).as_posix(), r.ok) for p, r in sess.results.items() if p.is_relative_to(root)]
 
     def replan(self, reset_overrides: bool = False) -> None:
-        if not self.comparison:
+        if not self.comparisons:
             return
-        rows = self.comparison.rows
-        if reset_overrides:
-            for r in rows:
-                r.overridden = False
-        plan(rows, Mode(self.mode.currentText()))
-        if self.policy.currentText() != POLICY_WARN:
-            hold(rows, self.failing_rels(), "failed the codec check")
-        self.model.codec = self._codec_map()
-        self.model.set_rows(rows)
+        mode = Mode(self.mode.currentText())
+        codec: dict[tuple[int, str], bool] = {}
+        for i, cmp in enumerate(self.comparisons):
+            if reset_overrides:
+                for r in cmp.rows:
+                    r.overridden = False
+            plan(cmp.rows, mode)
+            results = self._codec_results(cmp.left_root)
+            codec.update({(i, rel.casefold()): ok for rel, ok in results})
+            if self.policy.currentText() != POLICY_WARN:
+                hold(cmp.rows, {rel for rel, ok in results if not ok}, "failed the codec check")
+        self.model.codec = codec
+        self.model.set_rows(self.comparisons)
         self._refresh_summary()
 
     def _refresh_summary(self) -> None:
         self._update_chips()
-        rows = self.comparison.rows if self.comparison else []
+        rows = self.all_rows()
         acting = [r for r in rows if r.action != Action.NONE]
         copies = [r for r in acting if r.action in (Action.TO_RIGHT, Action.TO_LEFT)]
         deletes = [r for r in acting if r.action in (Action.DELETE_RIGHT, Action.DELETE_LEFT)]
@@ -379,24 +424,40 @@ class SyncPage(Page):
         self.update_sync_button()
 
     def problems(self) -> list[str]:
+        pairs = self.app.pairs()
+        if not pairs:
+            return ["Add a folder pair at the top: a source on the left, a destination on the right."]
         out = []
-        src, dst = self.app.source(), self.app.dest()
-        if not src or not src.is_dir():
-            out.append("Choose a source folder that exists.")
-        if not dst:
-            out.append("Choose a destination folder.")
-        elif src and dst.resolve() == src.resolve():
-            out.append("Source and destination are the same folder.")
-        elif src and (dst.resolve().is_relative_to(src.resolve()) or src.resolve().is_relative_to(dst.resolve())):
-            out.append("One folder is inside the other.")
+        for n, (src, dst) in enumerate(pairs, start=1):
+            if not src:
+                out.append(f"Pair {n}: choose a source folder.")
+            elif not src.is_dir():
+                out.append(f"Pair {n}: source folder doesn't exist ({src}).")
+            if not dst:
+                out.append(f"Pair {n}: choose a destination folder.")
+            elif src:
+                s_, d_ = src.resolve(), dst.resolve()
+                if s_ == d_:
+                    out.append(f"Pair {n}: source and destination are the same folder.")
+                elif d_.is_relative_to(s_) or s_.is_relative_to(d_):
+                    out.append(f"Pair {n}: one folder is inside the other.")
+        # A destination must not be written by two pairs, or be inside any source.
+        dests = [(n, d.resolve()) for n, (_, d) in enumerate(pairs, start=1) if d]
+        for i, (n1, d1) in enumerate(dests):
+            for n2, d2 in dests[i + 1:]:
+                if d1 == d2 or d1.is_relative_to(d2) or d2.is_relative_to(d1):
+                    out.append(f"Pairs {n1} and {n2} write to the same destination.")
+            for n2, (s2, _) in enumerate(pairs, start=1):
+                if s2 and n2 != n1 and (d1 == s2.resolve() or d1.is_relative_to(s2.resolve())):
+                    out.append(f"Pair {n1}'s destination is inside pair {n2}'s source.")
         return out
 
     def update_sync_button(self) -> None:
-        cmp = self.comparison
-        ok = bool(cmp) and not self.busy and any(r.action != Action.NONE for r in cmp.rows)
+        rows = self.all_rows()
+        ok = bool(rows) and not self.busy and any(r.action != Action.NONE for r in rows)
         tip = ""
-        if cmp and self.policy.currentText() == POLICY_BLOCK:
-            blocked = [r for r in cmp.rows if r.held]
+        if rows and self.policy.currentText() == POLICY_BLOCK:
+            blocked = [r for r in rows if r.held]
             if blocked:
                 ok, tip = False, f"{len(blocked)} files failed the codec check. Fix them or change 'Failed codec'."
                 self.summary.setText(f"BLOCKED  ·  {len(blocked)} FILES FAILED THE CODEC CHECK")
@@ -409,7 +470,7 @@ class SyncPage(Page):
         if problems := self.problems():
             return self.app.error("\n".join(problems))
         self.app.save_settings()
-        src, dst = self.app.source(), self.app.dest()
+        pairs = self.app.pairs()
         method = Method(self.method.currentText())
         extra = parse_excludes(self.excludes.text())
         self.cancel_flag.clear()
@@ -418,16 +479,18 @@ class SyncPage(Page):
         cancelled = self.cancel_flag.is_set
 
         def work(progress):
-            return compare(src, dst, method, extra, lambda _m, n: progress(n, 0), cancelled)
+            return [compare(src, dst, method, extra, lambda _m, n: progress(n, 0), cancelled, pair=i)
+                    for i, (src, dst) in enumerate(pairs)]
 
-        def done(cmp: Comparison):
+        def done(comparisons: list[Comparison]):
             self._set_busy(False)
-            self.comparison = cmp
-            if cmp.right_missing:
-                self.log.appendPlainText(f"Destination doesn't exist yet; it will be created: {dst}")
+            self.comparisons = comparisons
+            for i, cmp in enumerate(comparisons, start=1):
+                if cmp.right_missing:
+                    self.log.appendPlainText(f"Pair {i}: destination doesn't exist yet, it will be created: {cmp.right_root}")
             self.replan(reset_overrides=True)
-            n = len(cmp.rows)
-            self.log.appendPlainText(f"Compared {n} files  ·  {src}  ⇄  {dst}")
+            n = sum(len(c.rows) for c in comparisons)
+            self.log.appendPlainText(f"Compared {n} files in {len(comparisons)} folder pair(s)")
 
         def failed(msg):
             self._set_busy(False)
@@ -441,7 +504,7 @@ class SyncPage(Page):
     # ---------- manual actions ----------
     def _menu(self, pos) -> None:
         sel = sorted({i.row() for i in self.view.selectionModel().selectedRows()})
-        rows = [self.model.visible[i] for i in sel]
+        rows = [r for i in sel if (r := self.model.row_at(i))]
         if not rows:
             return
         menu = QMenu(self)
@@ -492,20 +555,22 @@ class SyncPage(Page):
         return syncer.TrashFolder()
 
     def run_sync(self) -> None:
-        cmp = self.comparison
-        problems = self.problems() if cmp else ["Compare first."]
+        comparisons = self.comparisons
+        problems = self.problems() if comparisons else ["Compare first."]
         if problems:
             return self.app.error("\n".join(problems))
-        acting = [r for r in cmp.rows if r.action != Action.NONE]
+        all_rows = self.all_rows()
+        acting = [r for r in all_rows if r.action != Action.NONE]
         to_r = [r for r in acting if r.action == Action.TO_RIGHT]
         to_l = [r for r in acting if r.action == Action.TO_LEFT]
         dels = [r for r in acting if r.action in (Action.DELETE_RIGHT, Action.DELETE_LEFT)]
-        lines = [f"Copy {len(to_r)} files to the destination ({human(syncer.total_bytes(to_r))})"]
+        lines = [f"{len(comparisons)} folder pair(s)",
+                 f"Copy {len(to_r)} files to the destination ({human(syncer.total_bytes(to_r))})"]
         if to_l:
             lines.append(f"Copy {len(to_l)} files back to the source ({human(syncer.total_bytes(to_l))})")
         if dels:
             lines.append(f"Remove {len(dels)} files  →  {self.deletion.currentText().lower()}")
-        held = [r for r in cmp.rows if r.held]
+        held = [r for r in all_rows if r.held]
         if held:
             lines.append(f"Hold back {len(held)} files that failed the codec check")
         if QMessageBox.question(self, "pxlsync", "\n".join(lines) + "\n\nStart sync?") \
@@ -521,11 +586,26 @@ class SyncPage(Page):
         cancelled = self.cancel_flag.is_set
         self._last = ""
 
+        grand_total = max(syncer.total_bytes(acting), 1)
+
         def work(progress):
-            def say(done, total, msg):
-                self._last = msg
-                progress(int(done * 1000 / max(total, 1)), 1000)
-            return syncer.run(cmp, remover, say, cancelled, prune_empty_right_dirs=prune)
+            total = syncer.SyncStats()
+            for i, cmp in enumerate(comparisons, start=1):
+                before = total.bytes
+
+                def say(done, _t, msg, before=before, i=i):
+                    self._last = f"Pair {i}: {msg}" if len(comparisons) > 1 else msg
+                    progress(int((before + done) * 1000 / grand_total), 1000)
+
+                stats = syncer.run(cmp, remover, say, cancelled, prune_empty_right_dirs=prune)
+                total.copied += stats.copied
+                total.deleted += stats.deleted
+                total.bytes += stats.bytes
+                total.errors += [f"pair {i}: {e}" for e in stats.errors] if len(comparisons) > 1 else stats.errors
+                if stats.cancelled:
+                    total.cancelled = True
+                    break
+            return total
 
         def done(stats: syncer.SyncStats):
             self._set_busy(False)
@@ -551,14 +631,19 @@ class SyncPage(Page):
     # ---------- verify ----------
     def verify(self) -> None:
         """Probe the media copies in the destination and compare codecs with the source."""
-        sess, src, dst = self.app.session, self.app.scanned_root, self.app.dest()
-        if not sess.files or not dst or src != self.app.source():
-            return self.app.error("Run the codec check (01 CHECK) on this source first.")
+        sess = self.app.session
+        if not sess.files or not self.app.scan_current():
+            return self.app.error("Run the codec check (01 CHECK) on these source folders first.")
         if not self.app.ffprobe:
             return self.app.error("ffprobe is not installed.")
-        held = {r.casefold() for r in self.failing_rels()} if self.policy.currentText() != POLICY_WARN else set()
-        pairs = [(p, dst / p.relative_to(src)) for p in sess.files
-                 if p.relative_to(src).as_posix().casefold() not in held]
+        skip_failing = self.policy.currentText() != POLICY_WARN
+        pairs = []  # (source file, its copy in the destination), for every folder pair
+        for src, dst in self.app.pairs():
+            if not src or not dst:
+                continue
+            for p in sess.files:
+                if p.is_relative_to(src) and not (skip_failing and (r := sess.results.get(p)) and not r.ok):
+                    pairs.append((p, dst / p.relative_to(src)))
         present = [(s, d) for s, d in pairs if d.exists()]
         missing = [d for _, d in pairs if not d.exists()]
         self.log.appendPlainText(f"Verifying {len(present)} media files in the destination…")
