@@ -33,7 +33,10 @@ python -m pytest            # 13 tests, uses real ffmpeg-encoded clips
 
 ## macOS installer (.dmg)
 
-**On any Mac** (macOS 12+, Python 3.10+), from the repo folder:
+**Easiest:** double-click **Build Installer.command** in Finder. It checks for Python
+(and opens the python.org download page if it's missing), builds, then shows the finished DMG.
+
+**Or from Terminal** on any Mac (macOS 12+, Python 3.10+), in the repo folder:
 
 ```bash
 scripts/make_dmg.sh
